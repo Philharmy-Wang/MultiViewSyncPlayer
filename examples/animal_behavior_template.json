@@ -1,0 +1,11 @@
+{
+  "name": "Animal Behavior",
+  "fields": {
+    "subject_id": "",
+    "species": "",
+    "date": "",
+    "experiment": "",
+    "operator": "",
+    "notes": ""
+  }
+}

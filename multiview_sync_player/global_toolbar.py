@@ -27,6 +27,7 @@ class GlobalToolbar(QWidget):
     save_requested = Signal()
     save_as_requested = Signal()
     mark_frame = Signal()
+    metadata_requested = Signal()
     help_requested = Signal()
 
     def __init__(self, parent=None):
@@ -93,6 +94,11 @@ class GlobalToolbar(QWidget):
 
         b = QPushButton("💾 Save As...")
         b.clicked.connect(self.save_as_requested.emit)
+        layout.addWidget(b)
+
+        b = QPushButton("📋 Metadata")
+        b.setToolTip("Edit session metadata fields")
+        b.clicked.connect(self.metadata_requested.emit)
         layout.addWidget(b)
 
         b = QPushButton("📌 Mark Frame")

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QGridLayout, QMessageBox, QStatusBar,
-    QFileDialog,
+    QFileDialog, QDialog,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QShortcut, QKeySequence
@@ -28,6 +28,7 @@ from .video_decoder import probe_video_metadata
 from .sync_controller import SyncController
 from .global_toolbar import GlobalToolbar
 from .video_cell import VideoCell
+from .metadata import SessionMetadata
 
 
 class _EmptySlot(QWidget):
@@ -75,6 +76,7 @@ class MainWindow(QMainWindow):
         cfg.BACKEND = backend
 
         self.controller = SyncController()
+        self.metadata = SessionMetadata()
         self.cells = {}           # {view_name: VideoCell}
         self._slot_widgets = {}   # {(row, col): widget}
         self.temp_dir = tempfile.mkdtemp(prefix="mvsp_")
@@ -171,6 +173,7 @@ class MainWindow(QMainWindow):
         t.save_requested.connect(self._save)
         t.save_as_requested.connect(self._save_as)
         t.mark_frame.connect(self._mark_frame)
+        t.metadata_requested.connect(self._edit_metadata)
         t.help_requested.connect(self._show_help)
 
         ctrl.base_frame_changed.connect(self._on_base_frame_changed)
@@ -296,6 +299,10 @@ class MainWindow(QMainWindow):
 
         # Restore markers
         self.controller.markers = markers
+
+        # Restore metadata
+        meta_data = data.get("metadata", {})
+        self.metadata = SessionMetadata.from_dict(meta_data)
 
         # Initialize backends sequentially
         self._backend_queue = list(self.cells.keys())
@@ -561,12 +568,22 @@ class MainWindow(QMainWindow):
         self.controller.add_marker()
         self._update_status()
 
+    # ---- Metadata ----
+
+    def _edit_metadata(self):
+        from .metadata_editor import MetadataEditor
+        dlg = MetadataEditor(self.metadata, self)
+        if dlg.exec() == QDialog.Accepted:
+            self.metadata = dlg.get_metadata()
+            self._update_title()
+
     # ---- Save ----
 
     def _save(self):
         if not self.controller.save():
-            # No session path yet, do Save As
             self._save_as()
+        else:
+            self._write_metadata_to_session()
 
     def _save_as(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -576,6 +593,21 @@ class MainWindow(QMainWindow):
             if not path.endswith(".json"):
                 path += ".mvsp.json"
             self.controller.save(path)
+            self._write_metadata_to_session()
+
+    def _write_metadata_to_session(self):
+        """Append metadata into the session JSON file after controller.save()."""
+        sp = self.controller.session_path
+        if not sp or not Path(sp).exists():
+            return
+        try:
+            with open(sp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            data["metadata"] = self.metadata.to_dict()
+            with open(sp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     # ---- Status bar / title ----
 
@@ -600,8 +632,14 @@ class MainWindow(QMainWindow):
             total = max(total, info.get("total_frames", 0))
         speed = SPEED_STEPS[c.speed_index]
         session = Path(c.session_path).name if c.session_path else "Untitled"
+        # Include metadata summary in title
+        meta_summary = ""
+        if self.metadata:
+            s = self.metadata.summary(max_items=3)
+            if s:
+                meta_summary = f" — {s}"
         self.setWindowTitle(
-            f"MultiViewSyncPlayer — {session} — "
+            f"MultiViewSyncPlayer — {session}{meta_summary} — "
             f"Frame {c.base_frame}/{total} — {speed}x")
 
     # ---- Grid clear ----
@@ -638,6 +676,7 @@ class MainWindow(QMainWindow):
         self.controller.base_frame = 0
         self.controller.session_path = None
         self.controller.saved = True
+        self.metadata = SessionMetadata()
         self._update_status()
         self._update_title()
 
