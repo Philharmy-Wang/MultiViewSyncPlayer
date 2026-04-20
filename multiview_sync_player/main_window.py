@@ -3,7 +3,8 @@ multiview_sync_player.main_window — Main window
 
 Configurable grid + global toolbar + status bar.
 Manages VideoCell lifecycle, connects signals.
-Supports sync lock control, manual video selection, session management.
+Supports sync lock control, manual video selection, session management,
+configurable layout via LayoutConfig, startup wizard.
 Playback uses consumer-pull model: timer tick pulls frames from decoder buffers.
 """
 
@@ -14,14 +15,13 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QGridLayout, QMessageBox, QStatusBar,
-    QFileDialog, QDialog,
+    QFileDialog, QDialog, QMenu,
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QPoint
 from PySide6.QtGui import QShortcut, QKeySequence
 
 from .config import (
-    DEFAULT_GRID_ROWS, DEFAULT_GRID_COLS, SPEED_STEPS,
-    PLAYER_CONFIG_PATH, DEFAULT_FPS, BACKEND,
+    SPEED_STEPS, PLAYER_CONFIG_PATH, DEFAULT_FPS, BACKEND,
 )
 from .styles import DARK_THEME_QSS
 from .video_decoder import probe_video_metadata
@@ -29,12 +29,15 @@ from .sync_controller import SyncController
 from .global_toolbar import GlobalToolbar
 from .video_cell import VideoCell
 from .metadata import SessionMetadata
+from .layout_manager import LayoutConfig
 
 
 class _EmptySlot(QWidget):
     """Empty grid slot placeholder. Double-click to select video."""
 
     double_clicked = Signal(str)
+    remove_requested = Signal(str)
+    rename_requested = Signal(str)
 
     def __init__(self, view_name: str, label="No video\nDouble-click to select",
                  parent=None):
@@ -42,6 +45,8 @@ class _EmptySlot(QWidget):
         self._view_name = view_name
         self._label = label
         self.setMouseTracking(True)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
 
     def paintEvent(self, event):
         from PySide6.QtGui import QPainter, QColor, QPen, QFont
@@ -61,11 +66,21 @@ class _EmptySlot(QWidget):
         if path:
             self.double_clicked.emit(path)
 
+    def _show_context_menu(self, pos: QPoint):
+        menu = QMenu(self)
+        act_remove = menu.addAction("Remove this view")
+        act_rename = menu.addAction("Rename this view")
+        action = menu.exec(self.mapToGlobal(pos))
+        if action == act_remove:
+            self.remove_requested.emit(self._view_name)
+        elif action == act_rename:
+            self.rename_requested.emit(self._view_name)
+
 
 class MainWindow(QMainWindow):
     """Multi-view video synchronized playback main window."""
 
-    def __init__(self, session_path=None, backend='opencv'):
+    def __init__(self, session_path=None, backend='opencv', layout_config=None):
         super().__init__()
         self.setWindowTitle("MultiViewSyncPlayer")
         self.setMinimumSize(1200, 800)
@@ -81,20 +96,12 @@ class MainWindow(QMainWindow):
         self._slot_widgets = {}   # {(row, col): widget}
         self.temp_dir = tempfile.mkdtemp(prefix="mvsp_")
 
-        # Grid dimensions (can be changed by session / layout manager later)
-        self._grid_rows = DEFAULT_GRID_ROWS
-        self._grid_cols = DEFAULT_GRID_COLS
-
-        # Build view name list from grid dimensions
-        self._view_names = []
-        self._view_positions = {}  # {view_name: (row, col)}
-        idx = 1
-        for r in range(self._grid_rows):
-            for c in range(self._grid_cols):
-                vn = f"View {idx}"
-                self._view_names.append(vn)
-                self._view_positions[vn] = (r, c)
-                idx += 1
+        # Layout configuration
+        if layout_config:
+            self.layout_config = layout_config
+        else:
+            self.layout_config = LayoutConfig(rows=2, cols=3)
+        self._rebuild_view_maps()
 
         self._build_ui()
         self._connect_signals()
@@ -122,6 +129,13 @@ class MainWindow(QMainWindow):
 
         self.setStyleSheet(DARK_THEME_QSS)
 
+    # ---- View name / position maps ----
+
+    def _rebuild_view_maps(self):
+        """Rebuild _view_names and _view_positions from layout_config."""
+        self._view_names = list(self.layout_config.view_names)
+        self._view_positions = self.layout_config.view_positions()
+
     # ---- UI construction ----
 
     def _build_ui(self):
@@ -138,24 +152,39 @@ class MainWindow(QMainWindow):
         self.grid_layout = QGridLayout(self.grid_widget)
         self.grid_layout.setSpacing(2)
         self.grid_layout.setContentsMargins(0, 0, 0, 0)
-        for c in range(self._grid_cols):
-            self.grid_layout.setColumnStretch(c, 1)
-        for r in range(self._grid_rows):
-            self.grid_layout.setRowStretch(r, 1)
-
-        for vn in self._view_names:
-            r, c = self._view_positions[vn]
-            e = _EmptySlot(vn, f"{vn}\nDouble-click to select video")
-            e.double_clicked.connect(
-                lambda path, v=vn: self._on_manual_video_selected(v, path))
-            self.grid_layout.addWidget(e, r, c)
-            self._slot_widgets[(r, c)] = e
+        self._populate_grid()
 
         ml.addWidget(self.grid_widget, 1)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self._update_status()
+
+    def _populate_grid(self):
+        """Clear and populate the grid layout with empty slots."""
+        # Clear existing
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        self._slot_widgets.clear()
+
+        cfg = self.layout_config
+        for c in range(cfg.cols):
+            self.grid_layout.setColumnStretch(c, 1)
+        for r in range(cfg.rows):
+            self.grid_layout.setRowStretch(r, 1)
+
+        for vn, (r, c) in zip(cfg.view_names, cfg.positions()):
+            e = _EmptySlot(vn, f"{vn}\nDouble-click to select video")
+            e.double_clicked.connect(
+                lambda path, v=vn: self._on_manual_video_selected(v, path))
+            e.remove_requested.connect(self._on_remove_view)
+            e.rename_requested.connect(self._on_rename_view)
+            self.grid_layout.addWidget(e, r, c)
+            self._slot_widgets[(r, c)] = e
 
     # ---- Signal connections ----
 
@@ -174,6 +203,7 @@ class MainWindow(QMainWindow):
         t.save_as_requested.connect(self._save_as)
         t.mark_frame.connect(self._mark_frame)
         t.metadata_requested.connect(self._edit_metadata)
+        t.add_view_requested.connect(self._on_add_view)
         t.help_requested.connect(self._show_help)
 
         ctrl.base_frame_changed.connect(self._on_base_frame_changed)
@@ -245,10 +275,20 @@ class MainWindow(QMainWindow):
                 QMessageBox.Yes | QMessageBox.No)
             if ret != QMessageBox.Yes:
                 return
-        self._clear_all()
+        from .startup_wizard import StartupWizard
+        wizard = StartupWizard(self)
+        if wizard.exec() == QDialog.Accepted:
+            layout_cfg, metadata = wizard.get_results()
+            self._clear_all()
+            self.layout_config = layout_cfg
+            self._rebuild_view_maps()
+            self.metadata = metadata
+            self._populate_grid()
+            self._update_status()
+            self._update_title()
 
     def _load_session(self, path: str):
-        """Load a session file: restore videos, offsets, markers."""
+        """Load a session file: restore layout, videos, offsets, markers, metadata."""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -258,6 +298,13 @@ class MainWindow(QMainWindow):
 
         self._clear_all()
         self.controller.session_path = path
+
+        # Restore layout config
+        layout_data = data.get("layout", {})
+        if layout_data:
+            self.layout_config = LayoutConfig.from_dict(layout_data)
+            self._rebuild_view_maps()
+            self._populate_grid()
 
         videos = data.get("videos", {})
         offsets = data.get("offsets", {})
@@ -270,10 +317,8 @@ class MainWindow(QMainWindow):
                 print(f"[Session] Video not found, skipping: {video_path}")
                 continue
 
-            # Map view name to grid position
             pos = self._view_positions.get(vn)
             if pos is None:
-                # Try to find an empty slot
                 for slot_vn in self._view_names:
                     if slot_vn not in self.controller.video_info:
                         pos = self._view_positions[slot_vn]
@@ -294,17 +339,13 @@ class MainWindow(QMainWindow):
             }
             self.controller.offsets[vn] = offsets.get(vn, 0)
             self.controller.enabled_views.add(vn)
-
             self._create_cell(vn, pos[0], pos[1])
 
-        # Restore markers
         self.controller.markers = markers
 
-        # Restore metadata
         meta_data = data.get("metadata", {})
         self.metadata = SessionMetadata.from_dict(meta_data)
 
-        # Initialize backends sequentially
         self._backend_queue = list(self.cells.keys())
         QTimer.singleShot(200, self._init_next_backend)
 
@@ -339,7 +380,7 @@ class MainWindow(QMainWindow):
         self.play_timer.start(interval)
 
     def _on_play_tick(self):
-        """Display timer tick: pull frames from decoder buffers (consumer mode)."""
+        """Display timer tick: pull frames from decoder buffers."""
         if not self.controller.is_playing:
             return
 
@@ -356,7 +397,6 @@ class MainWindow(QMainWindow):
                     cell.display_image(qimg, target, fast=True)
 
     def _on_ui_refresh(self):
-        """Low-frequency UI refresh: status bar / title / overlay / slider / waveform."""
         if not self.controller.is_playing:
             return
         base = self.controller.base_frame
@@ -386,7 +426,6 @@ class MainWindow(QMainWindow):
                     cell.set_speed(speed)
 
     def _step_frames(self, delta):
-        """Global step: pause first, then seek to target frame."""
         was_playing = self.controller.is_playing
         if was_playing:
             self.controller.pause()
@@ -409,7 +448,6 @@ class MainWindow(QMainWindow):
     # ---- base_frame / offset update (pause/seek) ----
 
     def _on_base_frame_changed(self, frame):
-        """Pause/step/drag slider: seek to target frame."""
         for vn, cell in self.cells.items():
             if cell.synced and self.controller.is_view_enabled(vn):
                 target = frame + self.controller.offsets.get(vn, 0)
@@ -447,7 +485,6 @@ class MainWindow(QMainWindow):
         self.controller.offsets.setdefault(view_name, 0)
         self.controller.enabled_views.add(view_name)
 
-        # Remove existing cell/slot at this position
         if view_name in self.cells:
             old = self.cells.pop(view_name)
             old.cleanup()
@@ -562,6 +599,104 @@ class MainWindow(QMainWindow):
         else:
             self._select_view(vn)
 
+    # ---- View add / remove / rename ----
+
+    def _on_add_view(self):
+        """Add a new view slot: expand grid if needed, or reuse empty slot."""
+        # Find first empty slot (no video loaded)
+        for vn in self._view_names:
+            if vn not in self.controller.video_info:
+                # Prompt user to select video for this slot
+                path, _ = QFileDialog.getOpenFileName(
+                    self, f"Select video — {vn}", "",
+                    "Video files (*.mp4 *.avi *.mkv *.mov);;All files (*)")
+                if path:
+                    self._on_manual_video_selected(vn, path)
+                return
+
+        # All slots have videos — expand grid by adding a column
+        self.controller.pause()
+        self.play_timer.stop()
+
+        self.layout_config.cols += 1
+        new_idx = self.layout_config.slots_count()
+        new_name = f"View {new_idx}"
+        self.layout_config.view_names.append(new_name)
+        self._rebuild_view_maps()
+        self._populate_grid()
+        self._update_status()
+        self._update_title()
+
+    def _on_remove_view(self, view_name: str):
+        """Remove a view slot (called from right-click menu)."""
+        if len(self.layout_config.view_names) <= 1:
+            QMessageBox.information(self, "Cannot Remove",
+                                    "Must have at least one view slot.")
+            return
+
+        # Cleanup cell if loaded
+        if view_name in self.cells:
+            cell = self.cells.pop(view_name)
+            cell.cleanup()
+            self.grid_layout.removeWidget(cell)
+            cell.deleteLater()
+
+        # Remove from controller
+        self.controller.video_info.pop(view_name, None)
+        self.controller.offsets.pop(view_name, None)
+        self.controller.enabled_views.discard(view_name)
+
+        # Remove from layout config
+        self.layout_config.view_names.remove(view_name)
+        # Recalculate grid dimensions
+        count = len(self.layout_config.view_names)
+        # Keep current rows, reduce cols if possible
+        rows = self.layout_config.rows
+        cols = max(1, (count + rows - 1) // rows)
+        self.layout_config.cols = cols
+        # Trim extra names if needed
+        while len(self.layout_config.view_names) > rows * cols:
+            self.layout_config.view_names.pop()
+
+        self._rebuild_view_maps()
+        self._populate_grid()
+        self._update_status()
+        self._update_title()
+
+    def _on_rename_view(self, view_name: str):
+        """Rename a view slot (called from right-click menu)."""
+        from PySide6.QtWidgets import QInputDialog
+        new_name, ok = QInputDialog.getText(
+            self, "Rename View", f"New name for '{view_name}':",
+            text=view_name)
+        if ok and new_name.strip():
+            new_name = new_name.strip()
+            # Update layout config
+            idx = self.layout_config.view_names.index(view_name)
+            self.layout_config.view_names[idx] = new_name
+
+            # Update controller references
+            if view_name in self.controller.video_info:
+                self.controller.video_info[new_name] = self.controller.video_info.pop(view_name)
+            if view_name in self.controller.offsets:
+                self.controller.offsets[new_name] = self.controller.offsets.pop(view_name)
+            if view_name in self.controller.enabled_views:
+                self.controller.enabled_views.discard(view_name)
+                self.controller.enabled_views.add(new_name)
+            if self.controller.selected_view == view_name:
+                self.controller.selected_view = new_name
+
+            # Update cell
+            if view_name in self.cells:
+                cell = self.cells.pop(view_name)
+                cell.view_name = new_name
+                cell.overlay.view_name = new_name
+                self.cells[new_name] = cell
+
+            self._rebuild_view_maps()
+            self._update_status()
+            self._update_title()
+
     # ---- Markers ----
 
     def _mark_frame(self):
@@ -583,7 +718,7 @@ class MainWindow(QMainWindow):
         if not self.controller.save():
             self._save_as()
         else:
-            self._write_metadata_to_session()
+            self._write_extras_to_session()
 
     def _save_as(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -593,10 +728,10 @@ class MainWindow(QMainWindow):
             if not path.endswith(".json"):
                 path += ".mvsp.json"
             self.controller.save(path)
-            self._write_metadata_to_session()
+            self._write_extras_to_session()
 
-    def _write_metadata_to_session(self):
-        """Append metadata into the session JSON file after controller.save()."""
+    def _write_extras_to_session(self):
+        """Append metadata + layout into the session JSON file."""
         sp = self.controller.session_path
         if not sp or not Path(sp).exists():
             return
@@ -604,6 +739,7 @@ class MainWindow(QMainWindow):
             with open(sp, "r", encoding="utf-8") as f:
                 data = json.load(f)
             data["metadata"] = self.metadata.to_dict()
+            data["layout"] = self.layout_config.to_dict()
             with open(sp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
@@ -619,10 +755,11 @@ class MainWindow(QMainWindow):
         nm = len(c.markers)
         synced_n = sum(1 for cell in self.cells.values() if cell.synced)
         total_n = len(self.cells)
+        layout_str = f"{self.layout_config.rows}x{self.layout_config.cols}"
         self.status_bar.showMessage(
             f"FPS: {DEFAULT_FPS:.0f} | Base frame: {c.base_frame} | "
-            f"Speed: {speed:.2f}x | Selected: {sel} | "
-            f"Synced: {synced_n}/{total_n} | "
+            f"Speed: {speed:.2f}x | Layout: {layout_str} | "
+            f"Selected: {sel} | Synced: {synced_n}/{total_n} | "
             f"Markers: {nm} | Saved: {mark}")
 
     def _update_title(self):
@@ -632,7 +769,6 @@ class MainWindow(QMainWindow):
             total = max(total, info.get("total_frames", 0))
         speed = SPEED_STEPS[c.speed_index]
         session = Path(c.session_path).name if c.session_path else "Untitled"
-        # Include metadata summary in title
         meta_summary = ""
         if self.metadata:
             s = self.metadata.summary(max_items=3)
@@ -656,18 +792,7 @@ class MainWindow(QMainWindow):
             self.grid_layout.removeWidget(cell)
             cell.deleteLater()
         self.cells.clear()
-
-        for vn in self._view_names:
-            r, c = self._view_positions[vn]
-            w = self._slot_widgets.get((r, c))
-            if w:
-                self.grid_layout.removeWidget(w)
-                w.deleteLater()
-            e = _EmptySlot(vn, f"{vn}\nDouble-click to select video")
-            e.double_clicked.connect(
-                lambda path, v=vn: self._on_manual_video_selected(v, path))
-            self.grid_layout.addWidget(e, r, c)
-            self._slot_widgets[(r, c)] = e
+        self._slot_widgets.clear()
 
         self.controller.video_info.clear()
         self.controller.offsets.clear()
@@ -677,8 +802,6 @@ class MainWindow(QMainWindow):
         self.controller.session_path = None
         self.controller.saved = True
         self.metadata = SessionMetadata()
-        self._update_status()
-        self._update_title()
 
     # ---- Help ----
 
@@ -706,7 +829,8 @@ class MainWindow(QMainWindow):
         <tr><td><b>🔓 Unlocked</b></td><td>Independent play/drag slider</td></tr>
         </table>
         <p style='color:#888'>View slots: {view_list}<br>
-        Double-click a slot to select a video file.</p>""")
+        Double-click a slot to select a video file.<br>
+        Right-click a slot to remove or rename it.</p>""")
 
     # ---- Window geometry persistence ----
 

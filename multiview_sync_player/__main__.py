@@ -33,13 +33,29 @@ def main():
             print("  Download: https://github.com/shinchiro/mpv-winbuild-cmake/releases")
             args.backend = 'opencv'
 
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QDialog
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle('Fusion')
 
     from .main_window import MainWindow
-    win = MainWindow(session_path=args.session, backend=args.backend)
-    win.show()
+
+    if args.session:
+        # Direct session load, no wizard
+        win = MainWindow(session_path=args.session, backend=args.backend)
+        win.show()
+    else:
+        # Show startup wizard first
+        from .startup_wizard import StartupWizard
+        wizard = StartupWizard()
+        if wizard.exec() == QDialog.Accepted:
+            layout_cfg, metadata = wizard.get_results()
+            win = MainWindow(backend=args.backend, layout_config=layout_cfg)
+            win.metadata = metadata
+            win._update_title()
+            win.show()
+        else:
+            sys.exit(0)
+
     sys.exit(app.exec())
 
 

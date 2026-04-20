@@ -28,6 +28,7 @@ class GlobalToolbar(QWidget):
     save_as_requested = Signal()
     mark_frame = Signal()
     metadata_requested = Signal()
+    add_view_requested = Signal()
     help_requested = Signal()
 
     def __init__(self, parent=None):
@@ -99,6 +100,11 @@ class GlobalToolbar(QWidget):
         b = QPushButton("📋 Metadata")
         b.setToolTip("Edit session metadata fields")
         b.clicked.connect(self.metadata_requested.emit)
+        layout.addWidget(b)
+
+        b = QPushButton("➕ Add View")
+        b.setToolTip("Add a new view slot to the grid")
+        b.clicked.connect(self.add_view_requested.emit)
         layout.addWidget(b)
 
         b = QPushButton("📌 Mark Frame")
