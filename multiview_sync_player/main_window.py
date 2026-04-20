@@ -14,8 +14,8 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QGridLayout, QMessageBox, QStatusBar,
-    QFileDialog, QDialog, QMenu, QMenuBar, QLabel, QFrame,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox,
+    QStatusBar, QFileDialog, QDialog, QMenu, QMenuBar, QLabel, QFrame,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QSettings
 from PySide6.QtGui import QShortcut, QKeySequence, QAction
