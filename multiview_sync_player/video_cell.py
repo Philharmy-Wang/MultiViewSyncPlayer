@@ -504,7 +504,7 @@ class VideoCell(QWidget):
     # ---- Paint / resize ----
 
     def paintEvent(self, event):
-        pass
+        super().paintEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
