@@ -1,0 +1,35 @@
+{
+  "format": "mvsp.project",
+  "version": "1.0",
+  "name": "三箱实验 1.26（三视角）",
+  "description": "中科院昆明动物所三箱社会行为实验 1.26 数据。每个猕猴个体三个视角：正面笼2、正面笼3、顶部监控。",
+  "root_dir": "K:/三箱实验/step1/1.26",
+  "group_by": ["subject_id"],
+  "patterns": [
+    {
+      "view_name": "正面笼2",
+      "view_color": "#66bb6a",
+      "pattern": "^1\\.26\\s+(?P<subject_id>\\d+)\\.mp4$",
+      "subdirectory": ""
+    },
+    {
+      "view_name": "正面笼3",
+      "view_color": "#ffa726",
+      "pattern": "^1\\.26\\s+3\\s+(?P<subject_id>\\d+)\\.mp4$",
+      "subdirectory": ""
+    },
+    {
+      "view_name": "顶部监控",
+      "view_color": "#42a5f5",
+      "pattern": "^1\\.26\\s+(?P<subject_id>\\d+)\\s+监控\\.mp4$",
+      "subdirectory": ""
+    }
+  ],
+  "layout": { "rows": 2, "cols": 2 },
+  "metadata_template": {
+    "experiment": "三箱社会行为",
+    "date": "1.26",
+    "operator": "",
+    "notes": ""
+  }
+}

@@ -201,9 +201,13 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._on_session_open)
         file_menu.addAction(a)
 
-        a = QAction("新建会话...", self)
-        a.triggered.connect(self._on_session_new)
+        a = QAction("从项目模板加载...", self)
+        a.setShortcut("Ctrl+Shift+O")
+        a.triggered.connect(self._load_from_project_template)
         file_menu.addAction(a)
+
+        self.recent_templates_menu = file_menu.addMenu("最近模板")
+        self._rebuild_recent_templates_menu()
 
         file_menu.addSeparator()
 
@@ -908,7 +912,6 @@ class MainWindow(QMainWindow):
             f"GitHub: Philharmy-Wang/MultiViewSyncPlayer</a></p>")
 
     def _open_example_session(self):
-        # 定位 examples 目录
         examples_dir = Path(__file__).parent.parent / "examples"
         if not examples_dir.exists():
             examples_dir = Path(".")
@@ -917,6 +920,152 @@ class MainWindow(QMainWindow):
             "会话文件 (*.mvsp.json);;JSON 文件 (*.json);;所有文件 (*)")
         if path:
             self._load_session(path)
+
+    # ---- 项目模板 ----
+
+    def _load_from_project_template(self):
+        from .project_template import ProjectTemplate
+        from .project_browser import ProjectBrowser
+        default_dir = str((Path(__file__).parent.parent / 'examples').resolve())
+        path, _ = QFileDialog.getOpenFileName(
+            self, '选择项目模板文件', default_dir,
+            '项目模板 (*.mvsp.project.json);;JSON (*.json);;所有文件 (*.*)')
+        if not path:
+            return
+        try:
+            template = ProjectTemplate.load(path)
+        except Exception as e:
+            QMessageBox.critical(self, '打开失败', f'无法解析模板:\n{e}')
+            return
+        self._add_recent_template(path)
+        self._open_template_browser(template)
+
+    def _open_template_file(self, path):
+        from .project_template import ProjectTemplate
+        try:
+            template = ProjectTemplate.load(path)
+        except Exception as e:
+            QMessageBox.critical(self, '打开失败', f'无法解析模板:\n{e}')
+            return
+        self._add_recent_template(path)
+        self._open_template_browser(template)
+
+    def _open_template_browser(self, template):
+        from .project_browser import ProjectBrowser
+        browser = ProjectBrowser(template, self)
+        browser.entry_chosen.connect(self._apply_template_entry)
+        browser.exec()
+
+    def _apply_template_entry(self, template, entry):
+        """把扫描结果应用到当前会话：重建布局 + 合并元数据 + 加载视频。"""
+        from .layout_manager import LayoutConfig
+        view_names = [p.view_name for p in template.patterns]
+        n = len(view_names)
+        rows, cols = template.layout_rows, template.layout_cols
+        while rows * cols < n:
+            cols += 1
+        layout_cfg = LayoutConfig(rows=rows, cols=cols, view_names=view_names)
+        self._apply_layout_config(layout_cfg)
+
+        # 合并元数据：模板默认值 + 分组键（分组键覆盖同名）
+        md = SessionMetadata()
+        for k, v in template.metadata_template.items():
+            if v:
+                md.set(k, v)
+        for k, v in entry.keys.items():
+            md.set(k, v)
+        self.metadata = md
+        self.metadata_bar.set_metadata(md)
+        self._update_title()
+
+        # 按 patterns 顺序加载视频到对应格子
+        self.controller.pause()
+        for slot_idx, vname in enumerate(view_names):
+            fpath = entry.videos.get(vname)
+            if not fpath or not Path(fpath).exists():
+                continue
+            pos = self._view_positions.get(vname)
+            if pos is None:
+                continue
+            meta = probe_video_metadata(fpath)
+            if meta["total_frames"] <= 0:
+                continue
+            self.controller.video_info[vname] = {
+                "path": fpath,
+                "total_frames": meta["total_frames"],
+                "fps": meta["fps"],
+                "has_audio": meta["has_audio"],
+            }
+            self.controller.offsets.setdefault(vname, 0)
+            self.controller.enabled_views.add(vname)
+
+            # 清理旧格子
+            if vname in self.cells:
+                old = self.cells.pop(vname)
+                old.cleanup()
+                self.grid_layout.removeWidget(old)
+                old.deleteLater()
+
+            self._create_cell(vname, pos[0], pos[1])
+
+        # 按顺序初始化后端
+        self._backend_queue = list(self.cells.keys())
+        QTimer.singleShot(200, self._init_next_backend)
+
+        self.statusBar().showMessage(
+            f"已加载模板「{template.name}」: {entry.display_key}, "
+            f"{len(entry.videos)}/{n} 个视角", 5000)
+
+    def _apply_layout_config(self, layout_cfg):
+        """应用新的布局配置：清空并重建网格。"""
+        self.controller.pause()
+        self.play_timer.stop()
+        self._ui_timer.stop()
+        self.sync_timer.stop()
+
+        for vn, cell in self.cells.items():
+            cell.cleanup()
+            self.grid_layout.removeWidget(cell)
+            cell.deleteLater()
+        self.cells.clear()
+        self._slot_widgets.clear()
+        self.controller.video_info.clear()
+        self.controller.offsets.clear()
+        self.controller.enabled_views.clear()
+        self.controller.markers.clear()
+        self.controller.base_frame = 0
+        self.controller.session_path = None
+        self.controller.saved = True
+
+        self.layout_config = layout_cfg
+        self._rebuild_view_maps()
+        self._populate_grid()
+        self._update_status()
+        self._update_title()
+
+    def _add_recent_template(self, path):
+        s = QSettings('MultiViewSyncPlayer', 'App')
+        recent = list(s.value('recent_templates', [], type=list) or [])
+        if path in recent:
+            recent.remove(path)
+        recent.insert(0, path)
+        s.setValue('recent_templates', recent[:5])
+        self._rebuild_recent_templates_menu()
+
+    def _rebuild_recent_templates_menu(self):
+        self.recent_templates_menu.clear()
+        s = QSettings('MultiViewSyncPlayer', 'App')
+        recent = list(s.value('recent_templates', [], type=list) or [])
+        if not recent:
+            a = QAction('（无）', self)
+            a.setEnabled(False)
+            self.recent_templates_menu.addAction(a)
+            return
+        for p in recent:
+            a = QAction(Path(p).name, self)
+            a.setToolTip(p)
+            a.triggered.connect(lambda _=False, pp=p: self._open_template_file(pp))
+            self.recent_templates_menu.addAction(a)
 
     # ---- 首次运行欢迎 ----
 

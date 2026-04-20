@@ -23,3 +23,30 @@
 动物行为场景的元数据模板，包含 subject_id、species、date、experiment、operator、notes 字段。
 
 在元数据编辑器中可一键加载此模板。
+
+## 项目模板示例
+
+项目模板（`.mvsp.project.json`）描述视频目录的命名规则，工具可自动扫描并按规则分组加载。
+
+使用方式：菜单「文件 → 从项目模板加载」→ 选择模板文件 → 浏览器中选一组 → 加载到会话。
+
+### three_chamber_1.26.mvsp.project.json
+
+三箱实验 1.26 数据（正面笼2 + 正面笼3 + 顶部监控，三视角）。
+
+按 `subject_id`（猕猴编号）分组，每个个体自动匹配三个视角的视频文件。
+
+### three_chamber_1.28.mvsp.project.json
+
+三箱实验 1.28 数据（顶部 Cam2 + Cam3 + Cam4，三机位）。
+
+按 `subject_id` 分组，文件名带 `jk` 或 `jk-` 后缀。
+
+### 自定义模板
+
+可按相同格式创建自己的项目模板：
+
+1. `patterns` 中每个视角定义一个文件名正则（使用 `(?P<name>...)` 命名组）
+2. `group_by` 指定命名组名（如 `subject_id`），扫描结果按此字段分组
+3. `layout` 指定网格行列数
+4. `metadata_template` 指定默认元数据字段

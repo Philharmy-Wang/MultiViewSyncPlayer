@@ -1,0 +1,35 @@
+{
+  "format": "mvsp.project",
+  "version": "1.0",
+  "name": "三箱实验 1.28（顶部三机位）",
+  "description": "中科院昆明动物所三箱社会行为实验 1.28 数据。每个猕猴个体三个顶部机位：Cam2、Cam3、Cam4。文件名带 jk 或 jk- 后缀。",
+  "root_dir": "K:/三箱实验/step1/1.28",
+  "group_by": ["subject_id"],
+  "patterns": [
+    {
+      "view_name": "顶部 Cam2",
+      "view_color": "#ab47bc",
+      "pattern": "^1\\.28\\s+2\\s+(?P<subject_id>\\d+)\\s+jk-?\\.mp4$",
+      "subdirectory": ""
+    },
+    {
+      "view_name": "顶部 Cam3",
+      "view_color": "#ef5350",
+      "pattern": "^1\\.28\\s+3\\s+(?P<subject_id>\\d+)\\s+jk-?\\.mp4$",
+      "subdirectory": ""
+    },
+    {
+      "view_name": "顶部 Cam4",
+      "view_color": "#26c6da",
+      "pattern": "^1\\.28\\s+4\\s+(?P<subject_id>\\d+)\\s+jk-?\\.mp4$",
+      "subdirectory": ""
+    }
+  ],
+  "layout": { "rows": 2, "cols": 2 },
+  "metadata_template": {
+    "experiment": "三箱社会行为",
+    "date": "1.28",
+    "operator": "",
+    "notes": ""
+  }
+}
