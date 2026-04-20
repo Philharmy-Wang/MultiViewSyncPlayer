@@ -1,12 +1,12 @@
 """
-multiview_sync_player.startup_wizard — Startup wizard dialog
+multiview_sync_player.startup_wizard — 启动向导
 
-Three-page QWizard:
-  Page 1: Layout preset selection (or custom rows/cols)
-  Page 2: Metadata template selection (optional)
-  Page 3: View naming and color assignment
+三页 QWizard：
+  第 1 页：布局预设选择（或自定义行列）
+  第 2 页：元数据模板选择（可跳过）
+  第 3 页：视角命名和颜色分配
 
-Returns (LayoutConfig, SessionMetadata) on accept.
+完成后返回 (LayoutConfig, SessionMetadata)。
 """
 
 from PySide6.QtWidgets import (
@@ -22,19 +22,18 @@ from .metadata import SessionMetadata
 from .metadata_presets import get_preset_names, get_preset_by_name
 
 
-# ==================== Page 1: Layout ====================
+# ==================== 第 1 页：布局 ====================
 
 class _LayoutPage(QWizardPage):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setTitle("Layout Selection")
-        self.setSubTitle("Choose a grid layout for your views.")
+        self.setTitle("选择布局")
+        self.setSubTitle("选择视频网格的行列布局。")
 
         layout = QVBoxLayout(self)
 
-        # Preset combo
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Preset:"))
+        row1.addWidget(QLabel("预设:"))
         self.combo_preset = QComboBox()
         for name, r, c in LAYOUT_PRESETS:
             self.combo_preset.addItem(name)
@@ -42,15 +41,14 @@ class _LayoutPage(QWizardPage):
         row1.addWidget(self.combo_preset, 1)
         layout.addLayout(row1)
 
-        # Custom rows/cols
-        self.custom_group = QGroupBox("Custom Layout")
+        self.custom_group = QGroupBox("自定义布局")
         custom_lay = QHBoxLayout(self.custom_group)
-        custom_lay.addWidget(QLabel("Rows:"))
+        custom_lay.addWidget(QLabel("行数:"))
         self.spin_rows = QSpinBox()
         self.spin_rows.setRange(1, 9)
         self.spin_rows.setValue(2)
         custom_lay.addWidget(self.spin_rows)
-        custom_lay.addWidget(QLabel("Cols:"))
+        custom_lay.addWidget(QLabel("列数:"))
         self.spin_cols = QSpinBox()
         self.spin_cols.setRange(1, 9)
         self.spin_cols.setValue(3)
@@ -58,14 +56,13 @@ class _LayoutPage(QWizardPage):
         self.custom_group.setVisible(False)
         layout.addWidget(self.custom_group)
 
-        # Preview
-        self.preview_label = QLabel("2 × 3 = 6 slots")
+        self.preview_label = QLabel("2 × 3 = 6 个格子")
         self.preview_label.setStyleSheet(
             f"font-size: 11pt; color: {COLOR_TEXT}; padding: 8px;")
         layout.addWidget(self.preview_label)
         layout.addStretch()
 
-        # Default to "2x3 Six-view"
+        # 默认选中 "2x3 Six-view"
         self.combo_preset.setCurrentIndex(4)
         self._on_preset_changed(4)
 
@@ -81,7 +78,7 @@ class _LayoutPage(QWizardPage):
             self._update_preview(rows, cols)
 
     def _update_preview(self, rows, cols):
-        self.preview_label.setText(f"{rows} × {cols} = {rows * cols} slots")
+        self.preview_label.setText(f"{rows} × {cols} = {rows * cols} 个格子")
 
     def get_layout_config(self) -> LayoutConfig:
         idx = self.combo_preset.currentIndex()
@@ -92,20 +89,20 @@ class _LayoutPage(QWizardPage):
         return LayoutConfig(rows=rows, cols=cols)
 
 
-# ==================== Page 2: Metadata ====================
+# ==================== 第 2 页：元数据 ====================
 
 class _MetadataPage(QWizardPage):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setTitle("Session Metadata")
-        self.setSubTitle("Choose a metadata template, or skip to use empty defaults.")
+        self.setTitle("元数据")
+        self.setSubTitle("选择一个元数据模板，或跳过不设置。")
 
         layout = QVBoxLayout(self)
 
         row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Template:"))
+        row1.addWidget(QLabel("模板:"))
         self.combo_template = QComboBox()
-        self.combo_template.addItem("(Skip — no metadata)")
+        self.combo_template.addItem("（跳过 — 不设置元数据）")
         self.combo_template.addItems(get_preset_names())
         self.combo_template.currentTextChanged.connect(self._on_template_changed)
         row1.addWidget(self.combo_template, 1)
@@ -119,17 +116,17 @@ class _MetadataPage(QWizardPage):
         layout.addStretch()
 
     def _on_template_changed(self, text):
-        if text == "(Skip — no metadata)":
-            self.preview_label.setText("No metadata fields will be set.")
+        if text == "（跳过 — 不设置元数据）":
+            self.preview_label.setText("不设置任何元数据字段。")
             return
         preset = get_preset_by_name(text)
         if preset:
             fields = ", ".join(preset["fields"].keys())
-            self.preview_label.setText(f"Fields: {fields}")
+            self.preview_label.setText(f"字段: {fields}")
 
     def get_metadata(self) -> SessionMetadata:
         text = self.combo_template.currentText()
-        if text == "(Skip — no metadata)":
+        if text == "（跳过 — 不设置元数据）":
             return SessionMetadata()
         preset = get_preset_by_name(text)
         if not preset:
@@ -140,13 +137,13 @@ class _MetadataPage(QWizardPage):
         return meta
 
 
-# ==================== Page 3: View Naming ====================
+# ==================== 第 3 页：视角命名 ====================
 
 class _ViewNamingPage(QWizardPage):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setTitle("View Names")
-        self.setSubTitle("Customize names for each view slot.")
+        self.setTitle("命名视角")
+        self.setSubTitle("为每个格子设置名称和颜色。")
         self._editors = []
 
         self._main_layout = QVBoxLayout(self)
@@ -160,25 +157,22 @@ class _ViewNamingPage(QWizardPage):
         self._main_layout.addWidget(scroll)
 
     def initializePage(self):
-        """Called when this page is shown. Reads layout from page 1."""
-        # Clear previous editors
         for editor, label, color_btn in self._editors:
             editor.deleteLater()
             label.deleteLater()
             color_btn.deleteLater()
         self._editors.clear()
 
-        # Get layout from page 1
         layout_page: _LayoutPage = self.wizard().page(0)
         config = layout_page.get_layout_config()
 
-        header = QLabel("Slot")
+        header = QLabel("序号")
         header.setStyleSheet("font-weight: bold;")
         self._grid_layout.addWidget(header, 0, 0)
-        header2 = QLabel("View Name")
+        header2 = QLabel("视角名称")
         header2.setStyleSheet("font-weight: bold;")
         self._grid_layout.addWidget(header2, 0, 1)
-        header3 = QLabel("Color")
+        header3 = QLabel("颜色")
         header3.setStyleSheet("font-weight: bold;")
         self._grid_layout.addWidget(header3, 0, 2)
 
@@ -194,7 +188,6 @@ class _ViewNamingPage(QWizardPage):
             color_btn.setStyleSheet(
                 f"background-color: {color.name()}; border: 1px solid #666;")
             color_btn._color = color
-            # Color picker on click
             color_btn.clicked.connect(
                 lambda checked, btn=color_btn: self._pick_color(btn))
 
@@ -207,7 +200,7 @@ class _ViewNamingPage(QWizardPage):
         from PySide6.QtWidgets import QColorDialog
         from PySide6.QtGui import QColor
         current = getattr(btn, '_color', QColor(200, 200, 200))
-        color = QColorDialog.getColor(current, self, "Select View Color")
+        color = QColorDialog.getColor(current, self, "选择视角颜色")
         if color.isValid():
             btn._color = color
             btn.setStyleSheet(
@@ -224,14 +217,14 @@ class _ViewNamingPage(QWizardPage):
         return [btn._color.name() for _, _, btn in self._editors]
 
 
-# ==================== Wizard ====================
+# ==================== 向导 ====================
 
 class StartupWizard(QWizard):
-    """Three-page startup wizard returning (LayoutConfig, SessionMetadata)."""
+    """三页启动向导，返回 (LayoutConfig, SessionMetadata)。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("New Session Setup")
+        self.setWindowTitle("新建会话")
         self.setMinimumSize(560, 480)
         self.setWizardStyle(QWizard.ModernStyle)
 
@@ -240,7 +233,7 @@ class StartupWizard(QWizard):
         self.addPage(_ViewNamingPage())
 
     def get_results(self):
-        """Call after exec() returns Accepted. Returns (LayoutConfig, SessionMetadata)."""
+        """在 exec() 返回 Accepted 后调用。返回 (LayoutConfig, SessionMetadata)。"""
         layout_page: _LayoutPage = self.page(0)
         meta_page: _MetadataPage = self.page(1)
         naming_page: _ViewNamingPage = self.page(2)

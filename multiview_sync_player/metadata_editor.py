@@ -1,8 +1,7 @@
 """
-multiview_sync_player.metadata_editor — Metadata field editor dialog
+multiview_sync_player.metadata_editor — 元数据字段编辑对话框
 
-QDialog with preset template selector, editable table with drag-to-reorder,
-add/remove/move buttons, and OK/Cancel.
+预设模板选择器、可编辑表格（支持拖拽排序）、增删移动按钮、确定/取消。
 """
 
 from collections import OrderedDict
@@ -20,11 +19,11 @@ from .metadata_presets import get_preset_names, get_preset_by_name
 
 
 class MetadataEditor(QDialog):
-    """Dialog for editing session metadata fields."""
+    """元数据字段编辑对话框。"""
 
     def __init__(self, metadata: SessionMetadata, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Session Metadata")
+        self.setWindowTitle("编辑元数据")
         self.setMinimumSize(520, 400)
         self.resize(600, 480)
         self._result_metadata = None
@@ -32,9 +31,9 @@ class MetadataEditor(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
-        # ---- Preset selector ----
+        # ---- 预设模板 ----
         preset_row = QHBoxLayout()
-        lbl = QLabel("Preset template:")
+        lbl = QLabel("预设模板:")
         lbl.setStyleSheet("color: " + COLOR_TEXT + ";")
         preset_row.addWidget(lbl)
 
@@ -43,21 +42,21 @@ class MetadataEditor(QDialog):
         self.combo_preset.currentTextChanged.connect(self._on_preset_selected)
         preset_row.addWidget(self.combo_preset, 1)
 
-        self.btn_apply_preset = QPushButton("Apply")
-        self.btn_apply_preset.setToolTip("Replace current fields with preset template")
+        self.btn_apply_preset = QPushButton("应用模板")
+        self.btn_apply_preset.setToolTip("用所选模板替换当前字段")
         self.btn_apply_preset.clicked.connect(self._apply_preset)
         preset_row.addWidget(self.btn_apply_preset)
         layout.addLayout(preset_row)
 
-        # ---- Separator ----
+        # ---- 分隔线 ----
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setStyleSheet("color: #555;")
         layout.addWidget(sep)
 
-        # ---- Table ----
+        # ---- 表格 ----
         self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Field Name", "Value"])
+        self.table.setHorizontalHeaderLabels(["字段名", "值"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -66,40 +65,40 @@ class MetadataEditor(QDialog):
         self.table.verticalHeader().setVisible(False)
         layout.addWidget(self.table, 1)
 
-        # ---- Button row ----
+        # ---- 按钮行 ----
         btn_row = QHBoxLayout()
 
-        self.btn_add = QPushButton("➕ Add Field")
+        self.btn_add = QPushButton("➕ 添加字段")
         self.btn_add.clicked.connect(self._add_field)
         btn_row.addWidget(self.btn_add)
 
-        self.btn_remove = QPushButton("➖ Remove Selected")
+        self.btn_remove = QPushButton("➖ 删除所选")
         self.btn_remove.clicked.connect(self._remove_selected)
         btn_row.addWidget(self.btn_remove)
 
         btn_row.addSpacing(16)
 
-        self.btn_up = QPushButton("⬆ Move Up")
+        self.btn_up = QPushButton("⬆ 上移")
         self.btn_up.clicked.connect(self._move_up)
         btn_row.addWidget(self.btn_up)
 
-        self.btn_down = QPushButton("⬇ Move Down")
+        self.btn_down = QPushButton("⬇ 下移")
         self.btn_down.clicked.connect(self._move_down)
         btn_row.addWidget(self.btn_down)
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        # ---- OK / Cancel ----
+        # ---- 确定 / 取消 ----
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.accepted.connect(self._on_accept)
         btn_box.rejected.connect(self.reject)
         layout.addWidget(btn_box)
 
-        # Populate from existing metadata
+        # 填充现有元数据
         self._populate_from_metadata(metadata)
 
-    # ---- Populate ----
+    # ---- 填充 ----
 
     def _populate_from_metadata(self, meta: SessionMetadata):
         self.table.setRowCount(0)
@@ -115,10 +114,10 @@ class MetadataEditor(QDialog):
         self.table.setItem(row, 1, value_item)
         self.table.selectRow(row)
 
-    # ---- Preset ----
+    # ---- 预设 ----
 
     def _on_preset_selected(self, text):
-        pass  # Only apply on button click
+        pass
 
     def _apply_preset(self):
         preset_name = self.combo_preset.currentText()
@@ -129,11 +128,10 @@ class MetadataEditor(QDialog):
         for name, default_val in preset["fields"].items():
             self._add_row(name, default_val)
 
-    # ---- Row operations ----
+    # ---- 行操作 ----
 
     def _add_field(self):
         self._add_row("new_field", "")
-        # Select the name cell for immediate editing
         row = self.table.rowCount() - 1
         self.table.editItem(self.table.item(row, 0))
 
@@ -156,7 +154,6 @@ class MetadataEditor(QDialog):
         self._swap_rows(row, row + 1)
 
     def _swap_rows(self, r1, r2):
-        # Swap both columns
         for col in range(2):
             item1 = self.table.takeItem(r1, col)
             item2 = self.table.takeItem(r2, col)
@@ -170,10 +167,9 @@ class MetadataEditor(QDialog):
             return None
         return items[0].row()
 
-    # ---- Accept ----
+    # ---- 确认 ----
 
     def _on_accept(self):
-        """Validate and build result SessionMetadata."""
         meta = SessionMetadata()
         seen = set()
         for row in range(self.table.rowCount()):
@@ -185,24 +181,22 @@ class MetadataEditor(QDialog):
             value = value_item.text() if value_item else ""
 
             if not name:
-                continue  # skip empty field names
+                continue
 
-            # Validate identifier
             from .metadata import _FIELD_RE
             if not _FIELD_RE.match(name):
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.warning(
-                    self, "Invalid Field Name",
-                    f"Row {row + 1}: '{name}' is not a valid field name.\n"
-                    f"Use only letters, digits, underscores. "
-                    f"Cannot start with a digit.")
+                    self, "字段名无效",
+                    f"第 {row + 1} 行：'{name}' 不是合法字段名。\n"
+                    f"只能使用字母、数字、下划线，不能以数字开头。")
                 return
 
             if name in seen:
                 from PySide6.QtWidgets import QMessageBox
                 QMessageBox.warning(
-                    self, "Duplicate Field",
-                    f"Row {row + 1}: field '{name}' is defined more than once.")
+                    self, "字段重复",
+                    f"第 {row + 1} 行：字段 '{name}' 重复定义。")
                 return
             seen.add(name)
 
@@ -212,5 +206,4 @@ class MetadataEditor(QDialog):
         self.accept()
 
     def get_metadata(self) -> SessionMetadata:
-        """Return the edited metadata (only valid after accept)."""
         return self._result_metadata

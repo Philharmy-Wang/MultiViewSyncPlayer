@@ -1,27 +1,28 @@
 """
-multiview_sync_player.main_window — Main window
+multiview_sync_player.main_window — 主窗口
 
-Configurable grid + global toolbar + status bar.
-Manages VideoCell lifecycle, connects signals.
-Supports sync lock control, manual video selection, session management,
-configurable layout via LayoutConfig, startup wizard.
-Playback uses consumer-pull model: timer tick pulls frames from decoder buffers.
+可配置网格 + 全局工具栏 + 元数据栏 + 状态栏。
+管理 VideoCell 生命周期，连接信号。
+支持同步锁控制、手动视频选择、会话管理、可配置布局、启动向导。
+播放采用消费者 pull 模式：定时器 tick 从各解码线程缓冲区取帧。
 """
 
 import json
+import os
 import shutil
 import tempfile
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QGridLayout, QMessageBox, QStatusBar,
-    QFileDialog, QDialog, QMenu,
+    QFileDialog, QDialog, QMenu, QMenuBar, QLabel, QFrame,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QPoint
-from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QSettings
+from PySide6.QtGui import QShortcut, QKeySequence, QAction
 
 from .config import (
     SPEED_STEPS, PLAYER_CONFIG_PATH, DEFAULT_FPS, BACKEND,
+    COLOR_PANEL_BG, COLOR_ACCENT, COLOR_TEXT, COLOR_TEXT_DIM,
 )
 from .styles import DARK_THEME_QSS
 from .video_decoder import probe_video_metadata
@@ -32,14 +33,73 @@ from .metadata import SessionMetadata
 from .layout_manager import LayoutConfig
 
 
+# ==================== 元数据栏 ====================
+
+class MetadataBar(QFrame):
+    """主窗口顶部的元数据摘要栏。"""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(36)
+        self.setStyleSheet(
+            f"background-color: {COLOR_PANEL_BG}; "
+            f"border-left: 3px solid {COLOR_ACCENT};")
+        self.setCursor(Qt.PointingHandCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(6)
+
+        icon = QLabel("📋")
+        icon.setStyleSheet("background: transparent; font-size: 12pt;")
+        layout.addWidget(icon)
+
+        self.label = QLabel()
+        self.label.setStyleSheet(
+            f"background: transparent; color: {COLOR_TEXT}; font-size: 9pt;")
+        self.label.setWordWrap(False)
+        layout.addWidget(self.label, 1)
+
+        self.btn_edit = QLabel("✏️ 编辑")
+        self.btn_edit.setStyleSheet(
+            f"background: transparent; color: {COLOR_ACCENT}; font-size: 9pt;")
+        layout.addWidget(self.btn_edit)
+
+        self._metadata = None
+        self.set_metadata(None)
+
+    def set_metadata(self, metadata):
+        self._metadata = metadata
+        if not metadata or not metadata.names():
+            self.label.setText(
+                "<span style='color:#888'>尚未设置元数据，点击 ✏️ 编辑</span>")
+        else:
+            pairs = []
+            for k, v in metadata.items():
+                if v:
+                    pairs.append(f"<b>{k}</b>={v}")
+            if pairs:
+                self.label.setText(" | ".join(pairs))
+            else:
+                self.label.setText(
+                    "<span style='color:#888'>元数据字段为空，点击 ✏️ 编辑</span>")
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+
+
+# ==================== 空格子占位 ====================
+
 class _EmptySlot(QWidget):
-    """Empty grid slot placeholder. Double-click to select video."""
+    """无视频占位格。双击选视频，右键菜单。"""
 
     double_clicked = Signal(str)
     remove_requested = Signal(str)
     rename_requested = Signal(str)
 
-    def __init__(self, view_name: str, label="No video\nDouble-click to select",
+    def __init__(self, view_name: str, label="双击此处选择视频",
                  parent=None):
         super().__init__(parent)
         self._view_name = view_name
@@ -52,24 +112,24 @@ class _EmptySlot(QWidget):
         from PySide6.QtGui import QPainter, QColor, QPen, QFont
         p = QPainter(self)
         p.fillRect(self.rect(), QColor("#222222"))
-        p.setPen(QPen(QColor("#3c3c3c"), 1))
-        p.drawRect(0, 0, self.width() - 1, self.height() - 1)
-        p.setPen(QColor("#888888"))
-        p.setFont(QFont("Microsoft YaHei", 11))
+        p.setPen(QPen(QColor(COLOR_ACCENT), 2, Qt.DashLine))
+        p.drawRect(4, 4, self.width() - 8, self.height() - 8)
+        p.setPen(QColor("#aaaaaa"))
+        p.setFont(QFont("Microsoft YaHei", 13, QFont.Bold))
         p.drawText(self.rect(), Qt.AlignCenter, self._label)
         p.end()
 
     def mouseDoubleClickEvent(self, event):
         path, _ = QFileDialog.getOpenFileName(
-            self, f"Select video — {self._view_name}", "",
-            "Video files (*.mp4 *.avi *.mkv *.mov);;All files (*)")
+            self, f"选择视频 — {self._view_name}", "",
+            "视频文件 (*.mp4 *.avi *.mkv *.mov);;所有文件 (*)")
         if path:
             self.double_clicked.emit(path)
 
     def _show_context_menu(self, pos: QPoint):
         menu = QMenu(self)
-        act_remove = menu.addAction("Remove this view")
-        act_rename = menu.addAction("Rename this view")
+        act_remove = menu.addAction("删除此视角")
+        act_rename = menu.addAction("重命名视角")
         action = menu.exec(self.mapToGlobal(pos))
         if action == act_remove:
             self.remove_requested.emit(self._view_name)
@@ -77,66 +137,109 @@ class _EmptySlot(QWidget):
             self.rename_requested.emit(self._view_name)
 
 
+# ==================== 主窗口 ====================
+
 class MainWindow(QMainWindow):
-    """Multi-view video synchronized playback main window."""
+    """多视角视频同步播放主窗口。"""
 
     def __init__(self, session_path=None, backend='opencv', layout_config=None):
         super().__init__()
-        self.setWindowTitle("MultiViewSyncPlayer")
+        self.setWindowTitle("多视角同步播放器")
         self.setMinimumSize(1200, 800)
         self.resize(1600, 900)
 
-        # Inject backend config
         from . import config as cfg
         cfg.BACKEND = backend
 
         self.controller = SyncController()
         self.metadata = SessionMetadata()
-        self.cells = {}           # {view_name: VideoCell}
-        self._slot_widgets = {}   # {(row, col): widget}
+        self.cells = {}
+        self._slot_widgets = {}
         self.temp_dir = tempfile.mkdtemp(prefix="mvsp_")
 
-        # Layout configuration
         if layout_config:
             self.layout_config = layout_config
         else:
             self.layout_config = LayoutConfig(rows=2, cols=3)
         self._rebuild_view_maps()
 
+        self._build_menubar()
         self._build_ui()
         self._connect_signals()
         self._setup_shortcuts()
 
-        # Playback timer — precise timing + consumer-pull model
         self.play_timer = QTimer(self)
         self.play_timer.setTimerType(Qt.PreciseTimer)
         self.play_timer.timeout.connect(self._on_play_tick)
 
-        # UI refresh timer — 5Hz throttle for status bar / title / slider
         self._ui_timer = QTimer(self)
         self._ui_timer.setTimerType(Qt.CoarseTimer)
         self._ui_timer.timeout.connect(self._on_ui_refresh)
 
-        # Sync correction timer (mpv backend)
         self.sync_timer = QTimer(self)
         self.sync_timer.timeout.connect(self._sync_correction)
 
         self._restore_geometry()
 
-        # Load session if provided
         if session_path:
             QTimer.singleShot(100, lambda: self._load_session(session_path))
 
         self.setStyleSheet(DARK_THEME_QSS)
 
-    # ---- View name / position maps ----
+        # 首次运行欢迎气泡
+        QTimer.singleShot(500, self._show_welcome_if_first_run)
+
+    # ---- 菜单栏 ----
+
+    def _build_menubar(self):
+        menubar = self.menuBar()
+
+        # 文件菜单
+        file_menu = menubar.addMenu("文件(&F)")
+        a = QAction("打开会话...", self)
+        a.setShortcut("Ctrl+O")
+        a.triggered.connect(self._on_session_open)
+        file_menu.addAction(a)
+
+        a = QAction("新建会话...", self)
+        a.triggered.connect(self._on_session_new)
+        file_menu.addAction(a)
+
+        file_menu.addSeparator()
+
+        a = QAction("保存", self)
+        a.setShortcut("Ctrl+S")
+        a.triggered.connect(self._save)
+        file_menu.addAction(a)
+
+        a = QAction("另存为...", self)
+        a.triggered.connect(self._save_as)
+        file_menu.addAction(a)
+
+        # 帮助菜单
+        help_menu = menubar.addMenu("帮助(&H)")
+
+        a = QAction("快速入门", self)
+        a.triggered.connect(self._show_quickstart)
+        help_menu.addAction(a)
+
+        a = QAction("打开示例会话...", self)
+        a.triggered.connect(self._open_example_session)
+        help_menu.addAction(a)
+
+        help_menu.addSeparator()
+
+        a = QAction("关于", self)
+        a.triggered.connect(self._show_about)
+        help_menu.addAction(a)
+
+    # ---- 视角映射 ----
 
     def _rebuild_view_maps(self):
-        """Rebuild _view_names and _view_positions from layout_config."""
         self._view_names = list(self.layout_config.view_names)
         self._view_positions = self.layout_config.view_positions()
 
-    # ---- UI construction ----
+    # ---- UI 构建 ----
 
     def _build_ui(self):
         central = QWidget()
@@ -147,6 +250,10 @@ class MainWindow(QMainWindow):
 
         self.toolbar = GlobalToolbar()
         ml.addWidget(self.toolbar)
+
+        self.metadata_bar = MetadataBar()
+        self.metadata_bar.clicked.connect(self._edit_metadata)
+        ml.addWidget(self.metadata_bar)
 
         self.grid_widget = QWidget()
         self.grid_layout = QGridLayout(self.grid_widget)
@@ -161,14 +268,11 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _populate_grid(self):
-        """Clear and populate the grid layout with empty slots."""
-        # Clear existing
         while self.grid_layout.count():
             item = self.grid_layout.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
-
         self._slot_widgets.clear()
 
         cfg = self.layout_config
@@ -178,7 +282,7 @@ class MainWindow(QMainWindow):
             self.grid_layout.setRowStretch(r, 1)
 
         for vn, (r, c) in zip(cfg.view_names, cfg.positions()):
-            e = _EmptySlot(vn, f"{vn}\nDouble-click to select video")
+            e = _EmptySlot(vn)
             e.double_clicked.connect(
                 lambda path, v=vn: self._on_manual_video_selected(v, path))
             e.remove_requested.connect(self._on_remove_view)
@@ -186,7 +290,7 @@ class MainWindow(QMainWindow):
             self.grid_layout.addWidget(e, r, c)
             self._slot_widgets[(r, c)] = e
 
-    # ---- Signal connections ----
+    # ---- 信号连接 ----
 
     def _connect_signals(self):
         t = self.toolbar
@@ -211,7 +315,7 @@ class MainWindow(QMainWindow):
         ctrl.playback_toggled.connect(self._on_playback_toggled)
         ctrl.markers_changed.connect(self._update_status)
 
-    # ---- Keyboard shortcuts ----
+    # ---- 快捷键 ----
 
     def _setup_shortcuts(self):
         def sc(key, fn):
@@ -226,7 +330,6 @@ class MainWindow(QMainWindow):
         sc(Qt.Key_Minus, lambda: self._set_speed(
             max(0, self.controller.speed_index - 1)))
         sc(Qt.Key_R, self.controller.reset_offsets)
-        sc("Ctrl+S", self._save)
         sc(Qt.Key_F, lambda: (
             self.showNormal() if self.isFullScreen() else self.showFullScreen()))
         sc(Qt.Key_H, self._show_help)
@@ -258,20 +361,20 @@ class MainWindow(QMainWindow):
                 ctrl.adjust_offset(ctrl.selected_view, d); return
         super().keyPressEvent(event)
 
-    # ---- Session callbacks ----
+    # ---- 会话回调 ----
 
     def _on_session_open(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Session", "",
-            "Session files (*.mvsp.json);;JSON files (*.json);;All files (*)")
+            self, "打开会话", "",
+            "会话文件 (*.mvsp.json);;JSON 文件 (*.json);;所有文件 (*)")
         if path:
             self._load_session(path)
 
     def _on_session_new(self):
         if not self.controller.saved and self.cells:
             ret = QMessageBox.question(
-                self, "Unsaved Changes",
-                "Current session has unsaved changes. Discard?",
+                self, "未保存的更改",
+                "当前会话有未保存的更改，是否丢弃？",
                 QMessageBox.Yes | QMessageBox.No)
             if ret != QMessageBox.Yes:
                 return
@@ -284,22 +387,21 @@ class MainWindow(QMainWindow):
             self._rebuild_view_maps()
             self.metadata = metadata
             self._populate_grid()
+            self.metadata_bar.set_metadata(self.metadata)
             self._update_status()
             self._update_title()
 
     def _load_session(self, path: str):
-        """Load a session file: restore layout, videos, offsets, markers, metadata."""
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
-            QMessageBox.warning(self, "Load Error", f"Failed to load session:\n{e}")
+            QMessageBox.warning(self, "加载失败", f"无法加载会话文件:\n{e}")
             return
 
         self._clear_all()
         self.controller.session_path = path
 
-        # Restore layout config
         layout_data = data.get("layout", {})
         if layout_data:
             self.layout_config = LayoutConfig.from_dict(layout_data)
@@ -310,13 +412,11 @@ class MainWindow(QMainWindow):
         offsets = data.get("offsets", {})
         markers = data.get("markers", [])
 
-        # Load each video into its slot
         for vn, vinfo in videos.items():
             video_path = vinfo.get("path", "")
             if not video_path or not Path(video_path).exists():
-                print(f"[Session] Video not found, skipping: {video_path}")
+                print(f"[会话] 视频未找到，跳过: {video_path}")
                 continue
-
             pos = self._view_positions.get(vn)
             if pos is None:
                 for slot_vn in self._view_names:
@@ -326,11 +426,9 @@ class MainWindow(QMainWindow):
                         break
                 if pos is None:
                     continue
-
             meta = probe_video_metadata(video_path)
             if meta["total_frames"] <= 0:
                 continue
-
             self.controller.video_info[vn] = {
                 "path": video_path,
                 "total_frames": meta["total_frames"],
@@ -342,14 +440,14 @@ class MainWindow(QMainWindow):
             self._create_cell(vn, pos[0], pos[1])
 
         self.controller.markers = markers
-
         meta_data = data.get("metadata", {})
         self.metadata = SessionMetadata.from_dict(meta_data)
+        self.metadata_bar.set_metadata(self.metadata)
 
         self._backend_queue = list(self.cells.keys())
         QTimer.singleShot(200, self._init_next_backend)
 
-    # ---- Playback control (consumer-pull model) ----
+    # ---- 播放控制 ----
 
     def _toggle_play(self):
         self.controller.toggle_play()
@@ -380,13 +478,10 @@ class MainWindow(QMainWindow):
         self.play_timer.start(interval)
 
     def _on_play_tick(self):
-        """Display timer tick: pull frames from decoder buffers."""
         if not self.controller.is_playing:
             return
-
         self.controller.base_frame += 1
         self.controller.saved = False
-
         for vn, cell in self.cells.items():
             if not cell.synced or not self.controller.is_view_enabled(vn):
                 continue
@@ -445,7 +540,7 @@ class MainWindow(QMainWindow):
                     self.controller.base_frame = max(0, corrected)
                     return
 
-    # ---- base_frame / offset update (pause/seek) ----
+    # ---- 帧偏移更新 ----
 
     def _on_base_frame_changed(self, frame):
         for vn, cell in self.cells.items():
@@ -463,19 +558,16 @@ class MainWindow(QMainWindow):
             self.cells[view].set_offset(offset)
         self._on_base_frame_changed(self.controller.base_frame)
 
-    # ---- Manual video selection ----
+    # ---- 手动选视频 ----
 
     def _on_manual_video_selected(self, view_name: str, file_path: str):
         pos = self._view_positions.get(view_name)
         if pos is None:
             return
-
         meta = probe_video_metadata(file_path)
         if meta["total_frames"] <= 0:
-            QMessageBox.warning(self, "Cannot Open",
-                                f"Cannot read video: {file_path}")
+            QMessageBox.warning(self, "无法打开", f"无法读取视频: {file_path}")
             return
-
         self.controller.video_info[view_name] = {
             "path": file_path,
             "total_frames": meta["total_frames"],
@@ -484,18 +576,15 @@ class MainWindow(QMainWindow):
         }
         self.controller.offsets.setdefault(view_name, 0)
         self.controller.enabled_views.add(view_name)
-
         if view_name in self.cells:
             old = self.cells.pop(view_name)
             old.cleanup()
             self.grid_layout.removeWidget(old)
             old.deleteLater()
-
         self._create_cell(view_name, pos[0], pos[1])
         QTimer.singleShot(100, lambda: self._init_single_cell(view_name))
 
     def _create_cell(self, view_name: str, row: int, col: int):
-        """Create a VideoCell and add it to the grid."""
         cell = VideoCell(view_name, self.temp_dir)
         cell.offset = self.controller.offsets.get(view_name, 0)
         cell.view_clicked.connect(
@@ -509,12 +598,11 @@ class MainWindow(QMainWindow):
         cell.solo_position_jump.connect(self._on_solo_position_jump)
         cell.video_file_selected.connect(self._on_manual_video_selected)
         cell.waveform.position_clicked.connect(self.controller.seek_to)
-
         self.cells[view_name] = cell
         self.grid_layout.addWidget(cell, row, col)
         self._slot_widgets[(row, col)] = cell
 
-    # ---- Backend initialization ----
+    # ---- 后端初始化 ----
 
     def _init_single_cell(self, view_name):
         cell = self.cells.get(view_name)
@@ -532,7 +620,6 @@ class MainWindow(QMainWindow):
             self._start_audio_loading()
             self._update_title()
             return
-
         vn = self._backend_queue.pop(0)
         cell = self.cells.get(vn)
         info = self.controller.video_info.get(vn, {})
@@ -543,7 +630,6 @@ class MainWindow(QMainWindow):
             cell.waveform.set_offset(self.controller.offsets.get(vn, 0))
             cell.waveform.set_markers(
                 [m["frame"] for m in self.controller.markers])
-
         QTimer.singleShot(100, self._init_next_backend)
 
     def _start_audio_loading(self):
@@ -564,7 +650,7 @@ class MainWindow(QMainWindow):
         if not self._audio_queue:
             self._audio_timer.stop()
 
-    # ---- Sync lock callback ----
+    # ---- 同步锁回调 ----
 
     def _on_sync_toggled(self, view_name, synced):
         if synced:
@@ -578,7 +664,7 @@ class MainWindow(QMainWindow):
         if cell:
             cell.seek_to_frame(frame)
 
-    # ---- View selection ----
+    # ---- 视角选择 ----
 
     def _select_view(self, vn):
         self.controller.selected_view = vn
@@ -599,25 +685,19 @@ class MainWindow(QMainWindow):
         else:
             self._select_view(vn)
 
-    # ---- View add / remove / rename ----
+    # ---- 视角增删改 ----
 
     def _on_add_view(self):
-        """Add a new view slot: expand grid if needed, or reuse empty slot."""
-        # Find first empty slot (no video loaded)
         for vn in self._view_names:
             if vn not in self.controller.video_info:
-                # Prompt user to select video for this slot
                 path, _ = QFileDialog.getOpenFileName(
-                    self, f"Select video — {vn}", "",
-                    "Video files (*.mp4 *.avi *.mkv *.mov);;All files (*)")
+                    self, f"选择视频 — {vn}", "",
+                    "视频文件 (*.mp4 *.avi *.mkv *.mov);;所有文件 (*)")
                 if path:
                     self._on_manual_video_selected(vn, path)
                 return
-
-        # All slots have videos — expand grid by adding a column
         self.controller.pause()
         self.play_timer.stop()
-
         self.layout_config.cols += 1
         new_idx = self.layout_config.slots_count()
         new_name = f"View {new_idx}"
@@ -628,54 +708,37 @@ class MainWindow(QMainWindow):
         self._update_title()
 
     def _on_remove_view(self, view_name: str):
-        """Remove a view slot (called from right-click menu)."""
         if len(self.layout_config.view_names) <= 1:
-            QMessageBox.information(self, "Cannot Remove",
-                                    "Must have at least one view slot.")
+            QMessageBox.information(self, "无法删除", "至少需要保留一个视角格子。")
             return
-
-        # Cleanup cell if loaded
         if view_name in self.cells:
             cell = self.cells.pop(view_name)
             cell.cleanup()
             self.grid_layout.removeWidget(cell)
             cell.deleteLater()
-
-        # Remove from controller
         self.controller.video_info.pop(view_name, None)
         self.controller.offsets.pop(view_name, None)
         self.controller.enabled_views.discard(view_name)
-
-        # Remove from layout config
         self.layout_config.view_names.remove(view_name)
-        # Recalculate grid dimensions
         count = len(self.layout_config.view_names)
-        # Keep current rows, reduce cols if possible
         rows = self.layout_config.rows
         cols = max(1, (count + rows - 1) // rows)
         self.layout_config.cols = cols
-        # Trim extra names if needed
         while len(self.layout_config.view_names) > rows * cols:
             self.layout_config.view_names.pop()
-
         self._rebuild_view_maps()
         self._populate_grid()
         self._update_status()
         self._update_title()
 
     def _on_rename_view(self, view_name: str):
-        """Rename a view slot (called from right-click menu)."""
         from PySide6.QtWidgets import QInputDialog
         new_name, ok = QInputDialog.getText(
-            self, "Rename View", f"New name for '{view_name}':",
-            text=view_name)
+            self, "重命名视角", f"'{view_name}' 的新名称:", text=view_name)
         if ok and new_name.strip():
             new_name = new_name.strip()
-            # Update layout config
             idx = self.layout_config.view_names.index(view_name)
             self.layout_config.view_names[idx] = new_name
-
-            # Update controller references
             if view_name in self.controller.video_info:
                 self.controller.video_info[new_name] = self.controller.video_info.pop(view_name)
             if view_name in self.controller.offsets:
@@ -685,34 +748,32 @@ class MainWindow(QMainWindow):
                 self.controller.enabled_views.add(new_name)
             if self.controller.selected_view == view_name:
                 self.controller.selected_view = new_name
-
-            # Update cell
             if view_name in self.cells:
                 cell = self.cells.pop(view_name)
                 cell.view_name = new_name
                 cell.overlay.view_name = new_name
                 self.cells[new_name] = cell
-
             self._rebuild_view_maps()
             self._update_status()
             self._update_title()
 
-    # ---- Markers ----
+    # ---- 标记 ----
 
     def _mark_frame(self):
         self.controller.add_marker()
         self._update_status()
 
-    # ---- Metadata ----
+    # ---- 元数据 ----
 
     def _edit_metadata(self):
         from .metadata_editor import MetadataEditor
         dlg = MetadataEditor(self.metadata, self)
         if dlg.exec() == QDialog.Accepted:
             self.metadata = dlg.get_metadata()
+            self.metadata_bar.set_metadata(self.metadata)
             self._update_title()
 
-    # ---- Save ----
+    # ---- 保存 ----
 
     def _save(self):
         if not self.controller.save():
@@ -722,8 +783,8 @@ class MainWindow(QMainWindow):
 
     def _save_as(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Session", "",
-            "Session files (*.mvsp.json);;JSON files (*.json);;All files (*)")
+            self, "保存会话", "",
+            "会话文件 (*.mvsp.json);;JSON 文件 (*.json);;所有文件 (*)")
         if path:
             if not path.endswith(".json"):
                 path += ".mvsp.json"
@@ -731,7 +792,6 @@ class MainWindow(QMainWindow):
             self._write_extras_to_session()
 
     def _write_extras_to_session(self):
-        """Append metadata + layout into the session JSON file."""
         sp = self.controller.session_path
         if not sp or not Path(sp).exists():
             return
@@ -745,22 +805,22 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    # ---- Status bar / title ----
+    # ---- 状态栏 / 标题 ----
 
     def _update_status(self):
         c = self.controller
         speed = SPEED_STEPS[c.speed_index]
-        sel = c.selected_view or "None"
+        sel = c.selected_view or "无"
         mark = "Y" if c.saved else "X"
         nm = len(c.markers)
         synced_n = sum(1 for cell in self.cells.values() if cell.synced)
         total_n = len(self.cells)
         layout_str = f"{self.layout_config.rows}x{self.layout_config.cols}"
         self.status_bar.showMessage(
-            f"FPS: {DEFAULT_FPS:.0f} | Base frame: {c.base_frame} | "
-            f"Speed: {speed:.2f}x | Layout: {layout_str} | "
-            f"Selected: {sel} | Synced: {synced_n}/{total_n} | "
-            f"Markers: {nm} | Saved: {mark}")
+            f"帧率: {DEFAULT_FPS:.0f} | 基准帧: {c.base_frame} | "
+            f"速度: {speed:.2f}x | 布局: {layout_str} | "
+            f"选中: {sel} | 同步: {synced_n}/{total_n} | "
+            f"标记: {nm} | 已保存: {mark}")
 
     def _update_title(self):
         c = self.controller
@@ -768,32 +828,29 @@ class MainWindow(QMainWindow):
         for info in c.video_info.values():
             total = max(total, info.get("total_frames", 0))
         speed = SPEED_STEPS[c.speed_index]
-        session = Path(c.session_path).name if c.session_path else "Untitled"
+        session = Path(c.session_path).name if c.session_path else "未命名"
         meta_summary = ""
         if self.metadata:
             s = self.metadata.summary(max_items=3)
             if s:
                 meta_summary = f" — {s}"
         self.setWindowTitle(
-            f"MultiViewSyncPlayer — {session}{meta_summary} — "
-            f"Frame {c.base_frame}/{total} — {speed}x")
+            f"多视角同步播放器 — {session}{meta_summary} — "
+            f"帧 {c.base_frame}/{total} — {speed}x")
 
-    # ---- Grid clear ----
+    # ---- 清空 ----
 
     def _clear_all(self):
-        """Stop playback and clear all cells, reset controller."""
         self.controller.pause()
         self.play_timer.stop()
         self._ui_timer.stop()
         self.sync_timer.stop()
-
         for vn, cell in self.cells.items():
             cell.cleanup()
             self.grid_layout.removeWidget(cell)
             cell.deleteLater()
         self.cells.clear()
         self._slot_widgets.clear()
-
         self.controller.video_info.clear()
         self.controller.offsets.clear()
         self.controller.enabled_views.clear()
@@ -803,36 +860,73 @@ class MainWindow(QMainWindow):
         self.controller.saved = True
         self.metadata = SessionMetadata()
 
-    # ---- Help ----
+    # ---- 帮助 / 关于 ----
 
     def _show_help(self):
         view_list = "  ".join(
             f"{i+1}={vn}" for i, vn in enumerate(self._view_names))
-        QMessageBox.information(self, "Keyboard Shortcuts", f"""
-        <h3>Keyboard Shortcuts</h3>
+        QMessageBox.information(self, "快捷键帮助", f"""
+        <h3>键盘快捷键</h3>
         <table cellpadding='3' style='font-size:10pt'>
-        <tr><td><b>Space</b></td><td>Play/Pause</td></tr>
-        <tr><td><b>D/A/W/S/Q/E</b></td><td>Global frame step</td></tr>
-        <tr><td><b>Home/End</b></td><td>Jump to start/end</td></tr>
-        <tr><td><b>1~9</b></td><td>Select view slot</td></tr>
-        <tr><td><b>0/Esc</b></td><td>Deselect</td></tr>
-        <tr><td><b>Left/Right (selected)</b></td><td>Offset +-1/+-25/+-250</td></tr>
-        <tr><td><b>M</b></td><td>Mark current frame</td></tr>
-        <tr><td><b>R</b></td><td>Reset all offsets</td></tr>
-        <tr><td><b>Ctrl+S</b></td><td>Save session</td></tr>
-        <tr><td><b>+/-</b></td><td>Playback speed</td></tr>
-        <tr><td><b>F</b></td><td>Fullscreen</td></tr>
+        <tr><td><b>空格</b></td><td>播放/暂停</td></tr>
+        <tr><td><b>D/A/W/S/Q/E</b></td><td>全局步进帧</td></tr>
+        <tr><td><b>Home/End</b></td><td>跳到开头/结尾</td></tr>
+        <tr><td><b>1~9</b></td><td>选中格子视角</td></tr>
+        <tr><td><b>0/Esc</b></td><td>取消选择</td></tr>
+        <tr><td><b>←/→ (选中时)</b></td><td>偏移 +-1/+-25/+-250</td></tr>
+        <tr><td><b>M</b></td><td>标记当前帧</td></tr>
+        <tr><td><b>R</b></td><td>重置所有偏移</td></tr>
+        <tr><td><b>Ctrl+S</b></td><td>保存会话</td></tr>
+        <tr><td><b>+/-</b></td><td>播放速度</td></tr>
+        <tr><td><b>F</b></td><td>全屏</td></tr>
         </table>
-        <h3>Sync Lock</h3>
+        <h3>同步锁</h3>
         <table cellpadding='3' style='font-size:10pt'>
-        <tr><td><b>🔗 Locked</b></td><td>Follow global play/pause/step</td></tr>
-        <tr><td><b>🔓 Unlocked</b></td><td>Independent play/drag slider</td></tr>
+        <tr><td><b>🔗 锁定</b></td><td>跟随全局播放/暂停/步进</td></tr>
+        <tr><td><b>🔓 解锁</b></td><td>独立播放/拖进度条</td></tr>
         </table>
-        <p style='color:#888'>View slots: {view_list}<br>
-        Double-click a slot to select a video file.<br>
-        Right-click a slot to remove or rename it.</p>""")
+        <p style='color:#888'>视角编号: {view_list}<br>
+        双击格子选择视频文件。右键格子可删除或重命名。</p>""")
 
-    # ---- Window geometry persistence ----
+    def _show_quickstart(self):
+        QMessageBox.information(self, '快速入门',
+            '欢迎使用多视角同步播放器！\n\n'
+            '📌 快速上手：\n'
+            '1. 双击任意格子选择视频文件\n'
+            '2. 播放所有视频，用视频上方的同步声（拍板/关门声）对齐\n'
+            '3. 拖动「偏移」按钮调整每个视角的帧偏移\n'
+            '4. 按 Ctrl+S 保存会话为 .mvsp.json 文件\n\n'
+            '💡 从菜单「帮助 → 打开示例会话」查看完整示例。')
+
+    def _show_about(self):
+        from . import __version__
+        QMessageBox.about(self, "关于",
+            f"<h3>多视角同步播放器</h3>"
+            f"<p>版本 {__version__}</p>"
+            f"<p>通用多视角视频同步对齐工具</p>"
+            f"<p><a href='https://github.com/Philharmy-Wang/MultiViewSyncPlayer'>"
+            f"GitHub: Philharmy-Wang/MultiViewSyncPlayer</a></p>")
+
+    def _open_example_session(self):
+        # 定位 examples 目录
+        examples_dir = Path(__file__).parent.parent / "examples"
+        if not examples_dir.exists():
+            examples_dir = Path(".")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开示例会话", str(examples_dir),
+            "会话文件 (*.mvsp.json);;JSON 文件 (*.json);;所有文件 (*)")
+        if path:
+            self._load_session(path)
+
+    # ---- 首次运行欢迎 ----
+
+    def _show_welcome_if_first_run(self):
+        settings = QSettings('MultiViewSyncPlayer', 'App')
+        if not settings.value('welcomed', False, type=bool):
+            self._show_quickstart()
+            settings.setValue('welcomed', True)
+
+    # ---- 窗口几何持久化 ----
 
     def _restore_geometry(self):
         try:
@@ -862,7 +956,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    # ---- Cleanup ----
+    # ---- 清理 ----
 
     def closeEvent(self, event):
         self.controller.pause()

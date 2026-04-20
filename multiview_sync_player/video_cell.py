@@ -65,7 +65,7 @@ class OverlayWidget(QWidget):
             painter.fillRect(0, 0, w, h, QColor(0, 0, 0, 160))
             painter.setPen(QColor(COLOR_TEXT_DIM))
             painter.setFont(QFont("Microsoft YaHei", 12))
-            painter.drawText(QRect(0, 0, w, h), Qt.AlignCenter, "Disabled")
+            painter.drawText(QRect(0, 0, w, h), Qt.AlignCenter, "已禁用")
             painter.end()
             return
 
@@ -272,27 +272,27 @@ class VideoCell(QWidget):
             cl.addWidget(b)
             return b
 
-        self.btn_sync = btn("🔗", "Sync lock: locked",
+        self.btn_sync = btn("🔗", "同步锁定（与其他格子共同播放）",
                             self._toggle_sync, fixed_width=26)
         self._update_sync_style()
-        self.btn_enable = btn("👁", "Enable/Disable",
+        self.btn_enable = btn("👁", "启用/禁用此视角",
                               self._toggle_enable, fixed_width=26)
         cl.addSpacing(2)
 
-        btn("◀◀", "Offset -25 frames",
+        btn("◀◀", "偏移 -25 帧",
             lambda: self.offset_changed.emit(self.view_name, -25))
-        btn("◀", "Offset -1 frame",
+        btn("◀", "偏移 -1 帧",
             lambda: self.offset_changed.emit(self.view_name, -1))
-        self.btn_solo = btn("▶/⏸", "Solo play/pause", self._toggle_solo)
+        self.btn_solo = btn("▶/⏸", "独立播放此视角", self._toggle_solo)
         self._solo_timer = QTimer(self)
         self._solo_timer.timeout.connect(self._on_solo_tick)
         self._solo_playing = False
-        btn("▶", "Offset +1 frame",
+        btn("▶", "偏移 +1 帧",
             lambda: self.offset_changed.emit(self.view_name, 1))
-        btn("▶▶", "Offset +25 frames",
+        btn("▶▶", "偏移 +25 帧",
             lambda: self.offset_changed.emit(self.view_name, 25))
         cl.addSpacing(4)
-        btn("-", "Offset -1 frame",
+        btn("-", "偏移 -1 帧",
             lambda: self.offset_changed.emit(self.view_name, -1), fixed_width=20)
         self.lbl_offset = QLabel("0")
         self.lbl_offset.setAlignment(Qt.AlignCenter)
@@ -300,7 +300,7 @@ class VideoCell(QWidget):
         self.lbl_offset.setStyleSheet(
             f"color: {COLOR_TEXT}; font-size: 9pt; font-family: Consolas;")
         cl.addWidget(self.lbl_offset)
-        btn("+", "Offset +1 frame",
+        btn("+", "偏移 +1 帧",
             lambda: self.offset_changed.emit(self.view_name, 1), fixed_width=20)
         cl.addStretch()
         layout.addWidget(ctrl)
@@ -322,13 +322,13 @@ class VideoCell(QWidget):
     def _update_sync_style(self):
         if self.synced:
             self.btn_sync.setText("🔗")
-            self.btn_sync.setToolTip("Sync lock: locked (follows global)")
+            self.btn_sync.setToolTip("同步锁定：跟随全局播放/暂停/步进")
             self.btn_sync.setStyleSheet(
                 CELL_BTN_STYLE +
                 "QPushButton { background: #2a5a3a; border-color: #4CAF50; }")
         else:
             self.btn_sync.setText("🔓")
-            self.btn_sync.setToolTip("Sync lock: unlocked (independent)")
+            self.btn_sync.setToolTip("同步解锁：独立播放/拖进度条")
             self.btn_sync.setStyleSheet(
                 CELL_BTN_STYLE +
                 "QPushButton { background: #5a3a2a; border-color: #FF9800; }")
@@ -337,8 +337,8 @@ class VideoCell(QWidget):
 
     def _on_double_click(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, f"Select video — {self.view_name}", "",
-            "Video files (*.mp4 *.avi *.mkv *.mov);;All files (*)")
+            self, f"选择视频 — {self.view_name}", "",
+            "视频文件 (*.mp4 *.avi *.mkv *.mov);;所有文件 (*)")
         if path:
             self.video_file_selected.emit(self.view_name, path)
 
@@ -593,7 +593,7 @@ class VideoCell(QWidget):
                 self.has_audio = True
                 self.waveform.set_audio(env, sr)
         except Exception as e:
-            print(f"Audio load failed [{self.view_name}]: {e}")
+            print(f"音频加载失败 [{self.view_name}]: {e}")
 
     # ---- Cleanup ----
 

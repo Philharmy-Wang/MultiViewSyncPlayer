@@ -1,15 +1,14 @@
 """
-multiview_sync_player.metadata_presets — Preset metadata templates
+multiview_sync_player.metadata_presets — 预设元数据模板
 
-Common field templates for different use scenarios.
-Each preset is a dict with 'name' (display name) and 'fields' (OrderedDict).
+常见场景的字段模板。每个预设有 'name'（显示名）和 'fields'（OrderedDict）。
 """
 
 from collections import OrderedDict
 
 PRESETS = [
     {
-        "name": "General Experiment",
+        "name": "通用实验",
         "fields": OrderedDict([
             ("session_name", ""),
             ("date", ""),
@@ -18,7 +17,7 @@ PRESETS = [
         ]),
     },
     {
-        "name": "Animal Behavior",
+        "name": "动物行为",
         "fields": OrderedDict([
             ("subject_id", ""),
             ("species", ""),
@@ -28,7 +27,18 @@ PRESETS = [
         ]),
     },
     {
-        "name": "Sports Analysis",
+        "name": "多视角同步对齐",
+        "fields": OrderedDict([
+            ("session_name", ""),
+            ("date", ""),
+            ("subject_id", ""),
+            ("experiment", ""),
+            ("operator", ""),
+            ("notes", ""),
+        ]),
+    },
+    {
+        "name": "体育分析",
         "fields": OrderedDict([
             ("event", ""),
             ("athlete", ""),
@@ -37,7 +47,7 @@ PRESETS = [
         ]),
     },
     {
-        "name": "Industrial Monitoring",
+        "name": "工业监控",
         "fields": OrderedDict([
             ("station_id", ""),
             ("shift", ""),
@@ -45,19 +55,17 @@ PRESETS = [
         ]),
     },
     {
-        "name": "Custom",
+        "name": "自定义",
         "fields": OrderedDict(),
     },
 ]
 
 
 def get_preset_names() -> list:
-    """Return list of preset display names."""
     return [p["name"] for p in PRESETS]
 
 
 def get_preset_by_name(name: str) -> dict:
-    """Get preset dict by display name. Returns None if not found."""
     for p in PRESETS:
         if p["name"] == name:
             return p

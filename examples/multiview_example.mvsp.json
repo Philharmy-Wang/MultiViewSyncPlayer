@@ -1,0 +1,79 @@
+{
+  "format": "mvsp.session",
+  "version": "1.0",
+  "created_at": "2026-04-20T10:00:00+08:00",
+  "description": "示例：动物行为多视角同步会话（2×3 布局）。请将 video_path 替换为实际视频路径后使用。",
+  "metadata": {
+    "session_name": "示例会话",
+    "date": "2026-01-26",
+    "subject_id": "24332",
+    "experiment": "三箱社会行为",
+    "operator": "张同学"
+  },
+  "layout": {
+    "rows": 2,
+    "cols": 3,
+    "view_names": ["顶部摄像头", "正面A笼", "正面B笼", "侧面左", "侧面右", "后方"]
+  },
+  "videos": {
+    "顶部摄像头": {
+      "path": "videos/top.mp4",
+      "total_frames": 75000,
+      "fps": 25.0,
+      "has_audio": true
+    },
+    "正面A笼": {
+      "path": "videos/front_A.mp4",
+      "total_frames": 75000,
+      "fps": 25.0,
+      "has_audio": true
+    },
+    "正面B笼": {
+      "path": "videos/front_B.mp4",
+      "total_frames": 75000,
+      "fps": 25.0,
+      "has_audio": true
+    },
+    "侧面左": {
+      "path": "videos/side_L.mp4",
+      "total_frames": 75000,
+      "fps": 25.0,
+      "has_audio": true
+    },
+    "侧面右": {
+      "path": "videos/side_R.mp4",
+      "total_frames": 75000,
+      "fps": 25.0,
+      "has_audio": true
+    },
+    "后方": {
+      "path": "videos/rear.mp4",
+      "total_frames": 75000,
+      "fps": 25.0,
+      "has_audio": true
+    }
+  },
+  "offsets": {
+    "顶部摄像头": 0,
+    "正面A笼": 0,
+    "正面B笼": 12,
+    "侧面左": -5,
+    "侧面右": 0,
+    "后方": 8
+  },
+  "markers": [
+    {
+      "frame": 1250,
+      "time_str": "00:50.00",
+      "note": "实验开始",
+      "view_frames": {
+        "顶部摄像头": 1250,
+        "正面A笼": 1250,
+        "正面B笼": 1262,
+        "侧面左": 1245,
+        "侧面右": 1250,
+        "后方": 1258
+      }
+    }
+  ]
+}
