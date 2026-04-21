@@ -87,6 +87,19 @@ VIEW_COLOR_PALETTE = [
 
 DEFAULT_VIEW_COLOR = QColor(200, 200, 200)
 
+# ---- View header strip colors (hex strings for QSS) ----
+VIEW_COLORS = [
+    "#FF6B6B",  # 珊瑚红
+    "#4ECDC4",  # 青绿
+    "#FFE66D",  # 明黄
+    "#95E1D3",  # 薄荷
+    "#C7A2E4",  # 淡紫
+    "#FFB6C1",  # 浅粉
+    "#87CEEB",  # 天蓝
+    "#F4A460",  # 沙棕
+    "#A8D8EA",  # 雾蓝
+]
+
 _view_color_cache = {}
 
 

@@ -18,11 +18,11 @@ import numpy as np
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider,
-    QSizePolicy, QFileDialog,
+    QSizePolicy, QFileDialog, QFrame, QApplication,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QRect
+from PySide6.QtCore import Qt, QTimer, Signal, QRect, QPoint, QMimeData, QByteArray
 from PySide6.QtGui import (
-    QImage, QPixmap, QPainter, QColor, QPen, QFont, QPolygon, QCursor
+    QImage, QPixmap, QPainter, QColor, QPen, QFont, QPolygon, QCursor, QDrag,
 )
 
 from .config import (
@@ -34,6 +34,63 @@ from .config import (
 from .styles import CELL_BTN_STYLE, PROGRESS_SLIDER_STYLE
 from .waveform_bar import WaveformBar
 from .video_decoder import PrefetchDecoder
+
+
+# ==================== Draggable color header ====================
+
+class DraggableHeader(QFrame):
+    """8px color strip at the top of each grid cell. Drag to swap cells."""
+
+    def __init__(self, parent_cell, color: str):
+        super().__init__(parent_cell)
+        self._parent_cell = parent_cell
+        self._color = color
+        self._drag_start = None
+        self.setFixedHeight(8)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setAutoFillBackground(True)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(f"background-color: {color};")
+
+    def set_color(self, color: str):
+        self._color = color
+        self.setStyleSheet(f"background-color: {color};")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start = event.position().toPoint()
+            self.setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is None or not (event.buttons() & Qt.LeftButton):
+            return
+        delta = event.position().toPoint() - self._drag_start
+        if delta.manhattanLength() < QApplication.startDragDistance():
+            return
+
+        drag = QDrag(self)
+        mime = QMimeData()
+        r, c = self._parent_cell.grid_pos
+        mime.setData("application/x-mvsp-cell-index",
+                     f"{r},{c}".encode())
+        drag.setMimeData(mime)
+
+        pixmap = self._parent_cell.grab()
+        scaled = pixmap.scaled(160, 90, Qt.KeepAspectRatio,
+                               Qt.SmoothTransformation)
+        drag.setPixmap(scaled)
+        drag.setHotSpot(QPoint(min(self._drag_start.x(), scaled.width()),
+                               min(self._drag_start.y(), scaled.height())))
+
+        self._drag_start = None
+        drag.exec(Qt.MoveAction)
+        self.setCursor(Qt.OpenHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start = None
+        self.setCursor(Qt.OpenHandCursor)
+        super().mouseReleaseEvent(event)
 
 
 # ==================== Info overlay ====================
@@ -219,6 +276,9 @@ class VideoCell(QWidget):
         self.has_audio = False
         self._pixmap = None
         self.synced = True
+        self.grid_pos = (-1, -1)
+        self.view_color = ""
+        self.setAcceptDrops(True)
 
         # Backend objects
         self.decoder = None   # PrefetchDecoder
@@ -228,6 +288,10 @@ class VideoCell(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(1)
+
+        # ---- Color header strip ----
+        self._header = DraggableHeader(self, "#888888")
+        layout.addWidget(self._header)
 
         # ---- Video area ----
         self.video_frame = VideoDisplay()
@@ -500,6 +564,27 @@ class VideoCell(QWidget):
         self.overlay.current_frame = target
         self.overlay.update()
         self.waveform.set_base_frame(base_frame)
+
+    # ---- Drag & drop swap ----
+
+    def set_view_color(self, color: str):
+        self.view_color = color
+        self._header.set_color(color)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat("application/x-mvsp-cell-index"):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasFormat("application/x-mvsp-cell-index"):
+            raw = bytes(event.mimeData().data(
+                "application/x-mvsp-cell-index"))
+            parts = raw.decode().split(",")
+            src_pos = (int(parts[0]), int(parts[1]))
+            mw = self.window()
+            if hasattr(mw, '_swap_cells'):
+                mw._swap_cells(src_pos, self.grid_pos)
+            event.acceptProposedAction()
 
     # ---- Paint / resize ----
 

@@ -23,12 +23,13 @@ from PySide6.QtGui import QShortcut, QKeySequence, QAction
 from .config import (
     SPEED_STEPS, PLAYER_CONFIG_PATH, DEFAULT_FPS, BACKEND,
     COLOR_PANEL_BG, COLOR_ACCENT, COLOR_TEXT, COLOR_TEXT_DIM,
+    VIEW_COLORS,
 )
 from .styles import DARK_THEME_QSS
 from .video_decoder import probe_video_metadata
 from .sync_controller import SyncController
 from .global_toolbar import GlobalToolbar
-from .video_cell import VideoCell
+from .video_cell import VideoCell, DraggableHeader
 from .metadata import SessionMetadata
 from .layout_manager import LayoutConfig
 
@@ -104,9 +105,24 @@ class _EmptySlot(QWidget):
         super().__init__(parent)
         self._view_name = view_name
         self._label = label
+        self.grid_pos = (-1, -1)
+        self.view_color = ""
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._header = DraggableHeader(self, "#888888")
+        layout.addWidget(self._header)
+        layout.addStretch()
+
+    def set_view_color(self, color: str):
+        self.view_color = color
+        self._header.set_color(color)
 
     def paintEvent(self, event):
         from PySide6.QtGui import QPainter, QColor, QPen, QFont
@@ -118,6 +134,21 @@ class _EmptySlot(QWidget):
         p.setFont(QFont("Microsoft YaHei", 13, QFont.Bold))
         p.drawText(self.rect(), Qt.AlignCenter, self._label)
         p.end()
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat("application/x-mvsp-cell-index"):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasFormat("application/x-mvsp-cell-index"):
+            raw = bytes(event.mimeData().data(
+                "application/x-mvsp-cell-index"))
+            parts = raw.decode().split(",")
+            src_pos = (int(parts[0]), int(parts[1]))
+            mw = self.window()
+            if hasattr(mw, '_swap_cells'):
+                mw._swap_cells(src_pos, self.grid_pos)
+            event.acceptProposedAction()
 
     def mouseDoubleClickEvent(self, event):
         path, _ = QFileDialog.getOpenFileName(
@@ -285,12 +316,14 @@ class MainWindow(QMainWindow):
         for r in range(cfg.rows):
             self.grid_layout.setRowStretch(r, 1)
 
-        for vn, (r, c) in zip(cfg.view_names, cfg.positions()):
+        for idx, (vn, (r, c)) in enumerate(zip(cfg.view_names, cfg.positions())):
             e = _EmptySlot(vn)
             e.double_clicked.connect(
                 lambda path, v=vn: self._on_manual_video_selected(v, path))
             e.remove_requested.connect(self._on_remove_view)
             e.rename_requested.connect(self._on_rename_view)
+            e.grid_pos = (r, c)
+            e.set_view_color(VIEW_COLORS[idx % len(VIEW_COLORS)])
             self.grid_layout.addWidget(e, r, c)
             self._slot_widgets[(r, c)] = e
 
@@ -602,9 +635,42 @@ class MainWindow(QMainWindow):
         cell.solo_position_jump.connect(self._on_solo_position_jump)
         cell.video_file_selected.connect(self._on_manual_video_selected)
         cell.waveform.position_clicked.connect(self.controller.seek_to)
+        cell.grid_pos = (row, col)
+        linear_idx = row * self.layout_config.cols + col
+        cell.set_view_color(VIEW_COLORS[linear_idx % len(VIEW_COLORS)])
         self.cells[view_name] = cell
         self.grid_layout.addWidget(cell, row, col)
         self._slot_widgets[(row, col)] = cell
+
+    # ---- Cell swap (drag & drop) ----
+
+    def _swap_cells(self, src_pos, dst_pos):
+        if src_pos == dst_pos:
+            return
+        src_widget = self._slot_widgets.get(src_pos)
+        dst_widget = self._slot_widgets.get(dst_pos)
+        if not src_widget or not dst_widget:
+            return
+
+        # Swap widget positions in grid layout
+        self.grid_layout.removeWidget(src_widget)
+        self.grid_layout.removeWidget(dst_widget)
+        self.grid_layout.addWidget(src_widget, dst_pos[0], dst_pos[1])
+        self.grid_layout.addWidget(dst_widget, src_pos[0], src_pos[1])
+
+        # Swap grid_pos attributes
+        src_widget.grid_pos = dst_pos
+        dst_widget.grid_pos = src_pos
+
+        # Swap view_colors
+        src_color = src_widget.view_color
+        dst_color = dst_widget.view_color
+        src_widget.set_view_color(dst_color)
+        dst_widget.set_view_color(src_color)
+
+        # Update _slot_widgets mapping
+        self._slot_widgets[src_pos] = dst_widget
+        self._slot_widgets[dst_pos] = src_widget
 
     # ---- 后端初始化 ----
 
