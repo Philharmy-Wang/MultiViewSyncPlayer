@@ -645,32 +645,38 @@ class MainWindow(QMainWindow):
     # ---- Cell swap (drag & drop) ----
 
     def _swap_cells(self, src_pos, dst_pos):
+        print(f"[SWAP-DIAG] src={src_pos} dst={dst_pos}")
         if src_pos == dst_pos:
             return
         src_widget = self._slot_widgets.get(src_pos)
         dst_widget = self._slot_widgets.get(dst_pos)
         if not src_widget or not dst_widget:
+            print(f"[SWAP-DIAG]  skipped: src={src_widget is not None} dst={dst_widget is not None}")
             return
 
-        # Swap widget positions in grid layout
+        # Move widgets in the grid layout (colors move with widgets automatically)
         self.grid_layout.removeWidget(src_widget)
         self.grid_layout.removeWidget(dst_widget)
         self.grid_layout.addWidget(src_widget, dst_pos[0], dst_pos[1])
         self.grid_layout.addWidget(dst_widget, src_pos[0], src_pos[1])
 
-        # Swap grid_pos attributes
+        # Sync grid_pos so future drags report correct source positions
         src_widget.grid_pos = dst_pos
         dst_widget.grid_pos = src_pos
-
-        # Swap view_colors
-        src_color = src_widget.view_color
-        dst_color = dst_widget.view_color
-        src_widget.set_view_color(dst_color)
-        dst_widget.set_view_color(src_color)
 
         # Update _slot_widgets mapping
         self._slot_widgets[src_pos] = dst_widget
         self._slot_widgets[dst_pos] = src_widget
+
+        # Force layout recalculation — QGridLayout doesn't repaint moved
+        # widgets automatically after remove+add, they stay at old geometry.
+        self.grid_layout.invalidate()
+        self.grid_layout.activate()
+        src_widget.updateGeometry()
+        dst_widget.updateGeometry()
+        print(f"[SWAP-DIAG]  geometry src@{dst_pos}={src_widget.geometry().getRect()} dst@{src_pos}={dst_widget.geometry().getRect()}")
+
+        print(f"[SWAP-DIAG]  done; slot_widgets keys = {list(self._slot_widgets.keys())}")
 
     # ---- 后端初始化 ----
 
