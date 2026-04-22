@@ -40,18 +40,18 @@ def main():
     from .main_window import MainWindow
 
     if args.session:
-        # Direct session load, no wizard
+        # Direct session load, skip LaunchDialog
         win = MainWindow(session_path=args.session, backend=args.backend)
         win.show()
     else:
-        # Show startup wizard first
-        from .startup_wizard import StartupWizard
-        wizard = StartupWizard()
-        if wizard.exec() == QDialog.Accepted:
-            layout_cfg, metadata = wizard.get_results()
+        # Show LaunchDialog to pick grid size
+        from .launch_dialog import LaunchDialog
+        from .layout_manager import LayoutConfig
+        dlg = LaunchDialog()
+        if dlg.exec() == QDialog.Accepted:
+            layout_cfg = LayoutConfig(rows=dlg.chosen_rows,
+                                      cols=dlg.chosen_cols)
             win = MainWindow(backend=args.backend, layout_config=layout_cfg)
-            win.metadata = metadata
-            win._update_title()
             win.show()
         else:
             sys.exit(0)

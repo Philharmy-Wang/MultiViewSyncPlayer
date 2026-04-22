@@ -251,6 +251,25 @@ class MainWindow(QMainWindow):
         a.triggered.connect(self._save_as)
         file_menu.addAction(a)
 
+        # 视图菜单
+        view_menu = menubar.addMenu("视图(&V)")
+
+        a = QAction("显示/隐藏工具栏", self)
+        a.setShortcut("Ctrl+T")
+        a.triggered.connect(self._toggle_toolbar)
+        view_menu.addAction(a)
+
+        a = QAction("显示/隐藏元数据栏", self)
+        a.triggered.connect(self._toggle_metadata_bar)
+        view_menu.addAction(a)
+
+        view_menu.addSeparator()
+
+        a = QAction("全屏", self)
+        a.setShortcut("F11")
+        a.triggered.connect(self._toggle_fullscreen)
+        view_menu.addAction(a)
+
         # 帮助菜单
         help_menu = menubar.addMenu("帮助(&H)")
 
@@ -973,6 +992,18 @@ class MainWindow(QMainWindow):
             '3. 拖动「偏移」按钮调整每个视角的帧偏移\n'
             '4. 按 Ctrl+S 保存会话为 .mvsp.json 文件\n\n'
             '💡 从菜单「帮助 → 打开示例会话」查看完整示例。')
+
+    def _toggle_toolbar(self):
+        self.toolbar.setVisible(not self.toolbar.isVisible())
+
+    def _toggle_metadata_bar(self):
+        self.metadata_bar.setVisible(not self.metadata_bar.isVisible())
+
+    def _toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
 
     def _show_about(self):
         from . import __version__
