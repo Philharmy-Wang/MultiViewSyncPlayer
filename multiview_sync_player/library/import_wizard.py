@@ -3,13 +3,13 @@
 Pages:
     Meta    — library root, experiment name, date, subject ID, notes.
     Sources — drag-drop / file-picker list of video source files.
-    Views   — placeholder (Step 3c).
-    Review  — placeholder (Step 3c).
+    Views   — editable direction / index / colour mapping table.
+    Review  — conflict/copy-mode selection, ASCII preview, validation.
 
 Input:  user interactions (dialog).
 Output: ImportPlan via get_plan() on accepted.
 
-Generated: 2026-04-23 21:30:00
+Generated: 2026-04-23 22:00:00
 """
 
 import datetime
@@ -17,7 +17,11 @@ from pathlib import Path
 from typing import List, Optional
 
 from PySide6.QtCore import QDate, QMimeData, Qt, QUrl
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -27,12 +31,17 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextBrowser,
     QVBoxLayout,
+    QWidget,
     QWizard,
     QWizardPage,
 )
 
-from .import_plan import ImportPlan, autodetect_view_mappings
+from .import_plan import ImportPlan, ViewMapping, autodetect_view_mappings, render_plan_preview
 from .paths import sanitize
 
 # ---------------------------------------------------------------------------
@@ -44,25 +53,6 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm", ".flv", ".wmv"}
 
 def _is_video(p: Path) -> bool:
     return p.suffix.lower() in VIDEO_EXTS
-
-
-# ---------------------------------------------------------------------------
-# Placeholder page (for pages implemented in Step 3c)
-# ---------------------------------------------------------------------------
-
-
-class PlaceholderPage(QWizardPage):
-    """占位页：显示标题和描述文本，始终 isComplete=True。"""
-
-    def __init__(self, title: str, description: str, parent=None):
-        super().__init__(parent)
-        self.setTitle(title)
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(description))
-        self._complete = True
-
-    def isComplete(self) -> bool:
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -264,12 +254,303 @@ class SourcesPage(QWizardPage):
 
 
 # ---------------------------------------------------------------------------
+# ViewsPage — direction / index / colour mapping table
+# ---------------------------------------------------------------------------
+
+COL_SOURCE, COL_VIEW, COL_DIR, COL_IDX, COL_COLOR, COL_INCL = range(6)
+_DIR_OPTIONS = ["", "front", "back", "left", "right", "top", "bottom"]
+
+
+class ViewsPage(QWizardPage):
+    """第三页：视角名 / 方向 / 编号 / 颜色映射表。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTitle("视角映射")
+        self.setSubTitle("确认或编辑每个视角的方向、编号和颜色。")
+
+        layout = QVBoxLayout(self)
+
+        # Toolbar row
+        tb = QHBoxLayout()
+        auto_btn = QPushButton("自动推断")
+        auto_btn.clicked.connect(self._on_autodetect)
+        tb.addWidget(auto_btn)
+        self._count_label = QLabel("已导入 0 / 0")
+        tb.addWidget(self._count_label)
+        tb.addStretch(1)
+        layout.addLayout(tb)
+
+        # Table
+        self._table = QTableWidget(0, 6)
+        self._table.setHorizontalHeaderLabels(
+            ["源文件", "视角名", "方向", "编号", "颜色", "包含"]
+        )
+        self._table.horizontalHeader().setStretchLastSection(True)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        layout.addWidget(self._table)
+
+    # -- lifecycle --
+
+    def initializePage(self):
+        sources_page: SourcesPage = self.wizard().page(
+            ImportWizard.PAGE_SOURCES
+        )
+        sources = sources_page.sources()
+        mappings = autodetect_view_mappings(sources)
+        self._load_mappings(mappings)
+
+    # -- data helpers --
+
+    def _load_mappings(self, mappings: List[ViewMapping]):
+        self._table.setRowCount(len(mappings))
+        for row, m in enumerate(mappings):
+            # Source (read-only)
+            src_item = QTableWidgetItem(m.source.name)
+            src_item.setFlags(src_item.flags() & ~Qt.ItemIsEditable)
+            src_item.setToolTip(str(m.source))
+            src_item.setData(Qt.UserRole, m.source)
+            self._table.setItem(row, COL_SOURCE, src_item)
+
+            # View name (editable)
+            view_item = QTableWidgetItem(m.view_name)
+            self._table.setItem(row, COL_VIEW, view_item)
+
+            # Direction combo
+            combo = QComboBox()
+            combo.addItems(_DIR_OPTIONS)
+            idx = _DIR_OPTIONS.index(m.direction) if m.direction in _DIR_OPTIONS else 0
+            combo.setCurrentIndex(idx)
+            self._table.setCellWidget(row, COL_DIR, combo)
+
+            # Index spinbox (0 = None)
+            spin = QSpinBox()
+            spin.setRange(0, 99)
+            spin.setValue(m.index if m.index is not None else 0)
+            spin.setSpecialValueText("—")
+            self._table.setCellWidget(row, COL_IDX, spin)
+
+            # Colour button
+            color_btn = QPushButton(m.color or "—")
+            if m.color:
+                color_btn.setStyleSheet(
+                    f"background-color: {m.color}; color: white;"
+                )
+            color_btn.setProperty("_hex", m.color or "")
+            color_btn.clicked.connect(lambda checked, r=row: self._pick_color(r))
+            self._table.setCellWidget(row, COL_COLOR, color_btn)
+
+            # Include checkbox (centred via wrapper widget)
+            chk = QCheckBox()
+            chk.setChecked(m.include)
+            chk_wrapper = QWidget()
+            chk_layout = QHBoxLayout(chk_wrapper)
+            chk_layout.addWidget(chk)
+            chk_layout.setAlignment(Qt.AlignCenter)
+            chk_layout.setContentsMargins(0, 0, 0, 0)
+            self._table.setCellWidget(row, COL_INCL, chk_wrapper)
+
+            # Connect per-row changes
+            combo.currentIndexChanged.connect(self._on_cell_changed)
+            spin.valueChanged.connect(self._on_cell_changed)
+            chk.stateChanged.connect(self._on_cell_changed)
+            view_item.dataChanged = None  # we use itemChanged signal below
+
+        self._table.itemChanged.connect(self._on_table_item_changed)
+        self._update_count()
+
+    def _on_table_item_changed(self, item):
+        self.completeChanged.emit()
+        self._update_count()
+
+    def _on_cell_changed(self):
+        self.completeChanged.emit()
+        self._update_count()
+
+    def _update_count(self):
+        ms = self.view_mappings()
+        included = sum(1 for m in ms if m.include)
+        self._count_label.setText(f"已导入 {included} / {len(ms)}")
+
+    def _on_autodetect(self):
+        sources_page: SourcesPage = self.wizard().page(
+            ImportWizard.PAGE_SOURCES
+        )
+        sources = sources_page.sources()
+        mappings = autodetect_view_mappings(sources)
+        self._load_mappings(mappings)
+
+    def _pick_color(self, row: int):
+        btn: QPushButton = self._table.cellWidget(row, COL_COLOR)
+        current = btn.property("_hex") or "#ffffff"
+        color = QColorDialog.getColor(QColor(current), self, "选择视角颜色")
+        if color.isValid():
+            hex_str = color.name()
+            btn.setText(hex_str)
+            btn.setStyleSheet(f"background-color: {hex_str}; color: white;")
+            btn.setProperty("_hex", hex_str)
+            self.completeChanged.emit()
+
+    def view_mappings(self) -> List[ViewMapping]:
+        """从表格读回当前状态，构造 List[ViewMapping]。"""
+        result: List[ViewMapping] = []
+        for row in range(self._table.rowCount()):
+            src_item = self._table.item(row, COL_SOURCE)
+            source: Path = src_item.data(Qt.UserRole)
+
+            view_item = self._table.item(row, COL_VIEW)
+            view_name = view_item.text() if view_item else source.stem
+
+            combo: QComboBox = self._table.cellWidget(row, COL_DIR)
+            direction = combo.currentText() or None
+
+            spin: QSpinBox = self._table.cellWidget(row, COL_IDX)
+            index = spin.value() if spin.value() > 0 else None
+
+            color_btn: QPushButton = self._table.cellWidget(row, COL_COLOR)
+            color = color_btn.property("_hex") or None
+
+            chk_wrapper = self._table.cellWidget(row, COL_INCL)
+            chk = chk_wrapper.findChild(QCheckBox)
+            include = chk.isChecked() if chk else True
+
+            result.append(
+                ViewMapping(
+                    source=source,
+                    view_name=view_name,
+                    direction=direction,
+                    index=index,
+                    color=color,
+                    include=include,
+                )
+            )
+        return result
+
+    def isComplete(self) -> bool:
+        ms = self.view_mappings()
+        included = [m for m in ms if m.include]
+        if not included:
+            return False
+        for m in included:
+            if not sanitize(m.view_name).strip():
+                return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# ReviewPage — conflict / copy-mode, preview, validation
+# ---------------------------------------------------------------------------
+
+_CONFLICT_ITEMS = [
+    ("跳过 (skip)", "skip"),
+    ("重命名 (rename)", "rename"),
+    ("覆盖 (overwrite)", "overwrite"),
+]
+_COPY_ITEMS = [
+    ("拷贝 (copy)", "copy"),
+    ("硬链接 (hardlink)", "hardlink"),
+    ("移动 (move)", "move"),
+]
+
+
+class ReviewPage(QWizardPage):
+    """第四页：确认策略、预览、校验。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTitle("确认 & 执行")
+        self.setSubTitle("检查导入预览，选择冲突策略和拷贝模式。")
+        self._plan: Optional[ImportPlan] = None
+
+        layout = QVBoxLayout(self)
+
+        # Strategy combos
+        form = QFormLayout()
+
+        self._conflict_combo = QComboBox()
+        for label, value in _CONFLICT_ITEMS:
+            self._conflict_combo.addItem(label, value)
+        self._conflict_combo.currentIndexChanged.connect(self._on_policy_changed)
+        form.addRow("冲突策略:", self._conflict_combo)
+
+        self._copy_combo = QComboBox()
+        for label, value in _COPY_ITEMS:
+            self._copy_combo.addItem(label, value)
+        self._copy_combo.currentIndexChanged.connect(self._on_policy_changed)
+        form.addRow("拷贝模式:", self._copy_combo)
+
+        layout.addLayout(form)
+
+        # Preview
+        self._text = QTextBrowser()
+        self._text.setFont(QFont("Consolas", 10))
+        self._text.setMaximumHeight(220)
+        layout.addWidget(self._text)
+
+        # Size estimate
+        self._size_label = QLabel("预计占用 —")
+        layout.addWidget(self._size_label)
+
+        # Validation errors
+        self._err_label = QLabel("—")
+        layout.addWidget(self._err_label)
+
+    def initializePage(self):
+        self._plan = self.wizard()._build_plan_from_pages()
+        # Apply combo selections
+        self._plan.conflict_policy = self._conflict_combo.currentData()
+        self._plan.copy_mode = self._copy_combo.currentData()
+        self._refresh()
+
+    def _on_policy_changed(self):
+        if self._plan is None:
+            return
+        self._plan.conflict_policy = self._conflict_combo.currentData()
+        self._plan.copy_mode = self._copy_combo.currentData()
+        self._refresh()
+
+    def _refresh(self):
+        preview = render_plan_preview(self._plan)
+        self._text.setPlainText(preview)
+
+        # Size estimate
+        total_bytes = 0
+        file_count = 0
+        for m in self._plan.view_mappings:
+            if m.include:
+                try:
+                    total_bytes += m.source.stat().st_size
+                    file_count += 1
+                except OSError:
+                    pass
+        if file_count:
+            gb = total_bytes / (1024 ** 3)
+            self._size_label.setText(f"预计占用 {gb:.2f} GB（{file_count} 个文件）")
+        else:
+            self._size_label.setText("预计占用 —")
+
+        # Validation
+        errs = self._plan.validate()
+        if errs:
+            self._err_label.setText("\n".join(f"• {e}" for e in errs))
+            self._err_label.setStyleSheet("color: #c62828;")
+        else:
+            self._err_label.setText("—")
+            self._err_label.setStyleSheet("")
+
+        self.completeChanged.emit()
+
+    def isComplete(self) -> bool:
+        return self._plan is not None and self._plan.validate() == []
+
+
+# ---------------------------------------------------------------------------
 # ImportWizard — top-level wizard
 # ---------------------------------------------------------------------------
 
 
 class ImportWizard(QWizard):
-    """四页导入向导：Meta → Sources → Views（占位）→ Review（占位）。
+    """四页导入向导：Meta → Sources → Views → Review。
 
     >>> import os; os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     """
@@ -290,27 +571,13 @@ class ImportWizard(QWizard):
         # Register pages
         self.setPage(self.PAGE_META, MetaPage(default_library_root))
         self.setPage(self.PAGE_SOURCES, SourcesPage())
-        self.setPage(
-            self.PAGE_VIEWS,
-            PlaceholderPage(
-                "视角映射", "Step 3c 将实现此页（视角名、方向、颜色映射表）"
-            ),
-        )
-        self.setPage(
-            self.PAGE_REVIEW,
-            PlaceholderPage(
-                "确认 & 执行", "Step 3c 将实现此页（冲突策略、拷贝模式、预览）"
-            ),
-        )
+        self.setPage(self.PAGE_VIEWS, ViewsPage())
+        self.setPage(self.PAGE_REVIEW, ReviewPage())
 
-    def get_plan(self) -> ImportPlan:
-        """从已填字段构造 ImportPlan。
-
-        view_mappings 通过 autodetect_view_mappings 默认填充。
-        conflict_policy='skip'，copy_mode='copy'。
-        """
+    def _build_plan_from_pages(self) -> ImportPlan:
+        """从各页字段构造 ImportPlan（供 ReviewPage / get_plan 调用）。"""
         meta: MetaPage = self.page(self.PAGE_META)
-        sources_page: SourcesPage = self.page(self.PAGE_SOURCES)
+        views: ViewsPage = self.page(self.PAGE_VIEWS)
 
         root = Path(self.field("library_root") or meta._root_edit.text())
         exp = self.field("experiment") or meta._exp_edit.text()
@@ -319,7 +586,20 @@ class ImportWizard(QWizard):
         subj = self.field("subject_id") or meta._subj_edit.text()
         notes = self.field("notes") or meta._notes_edit.toPlainText() or ""
 
-        mappings = autodetect_view_mappings(sources_page.sources())
+        mappings = views.view_mappings()
+
+        # Fallback: if ViewsPage was never initialised, autodetect from sources
+        if not mappings:
+            sources_page: SourcesPage = self.page(self.PAGE_SOURCES)
+            mappings = autodetect_view_mappings(sources_page.sources())
+
+        # Read combos from ReviewPage if initialised, else defaults
+        review: Optional[ReviewPage] = self.page(self.PAGE_REVIEW)
+        conflict = "skip"
+        copy_mode = "copy"
+        if review and review._plan is not None:
+            conflict = review._conflict_combo.currentData()
+            copy_mode = review._copy_combo.currentData()
 
         return ImportPlan(
             library_root=root,
@@ -328,6 +608,10 @@ class ImportWizard(QWizard):
             subject_id=subj,
             notes=notes,
             view_mappings=mappings,
-            conflict_policy="skip",
-            copy_mode="copy",
+            conflict_policy=conflict,
+            copy_mode=copy_mode,
         )
+
+    def get_plan(self) -> ImportPlan:
+        """从已填字段构造 ImportPlan。"""
+        return self._build_plan_from_pages()
