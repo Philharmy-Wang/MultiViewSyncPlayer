@@ -32,6 +32,7 @@ from .global_toolbar import GlobalToolbar
 from .video_cell import VideoCell, DraggableHeader
 from .metadata import SessionMetadata
 from .layout_manager import LayoutConfig, fit_layout_to_views
+from .session_io import SessionData, save_session, load_session
 from .library.browser import LibraryBrowserDock
 from .library.import_wizard import ImportWizard
 from .library.executor import ImportExecutor
@@ -466,60 +467,19 @@ class MainWindow(QMainWindow):
             self._update_title()
 
     def _load_session(self, path: str):
+        from .session_io import SessionFormatError
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = load_session(path)
+        except SessionFormatError as e:
+            QMessageBox.warning(self, "格式错误", f"会话文件格式不兼容:\n{e}")
+            return
         except Exception as e:
             QMessageBox.warning(self, "加载失败", f"无法加载会话文件:\n{e}")
             return
 
         self._clear_all()
         self.controller.session_path = path
-
-        layout_data = data.get("layout", {})
-        if layout_data:
-            self.layout_config = LayoutConfig.from_dict(layout_data)
-            self._rebuild_view_maps()
-            self._populate_grid()
-
-        videos = data.get("videos", {})
-        offsets = data.get("offsets", {})
-        markers = data.get("markers", [])
-
-        for vn, vinfo in videos.items():
-            video_path = vinfo.get("path", "")
-            if not video_path or not Path(video_path).exists():
-                print(f"[会话] 视频未找到，跳过: {video_path}")
-                continue
-            pos = self._view_positions.get(vn)
-            if pos is None:
-                for slot_vn in self._view_names:
-                    if slot_vn not in self.controller.video_info:
-                        pos = self._view_positions[slot_vn]
-                        vn = slot_vn
-                        break
-                if pos is None:
-                    continue
-            meta = probe_video_metadata(video_path)
-            if meta["total_frames"] <= 0:
-                continue
-            self.controller.video_info[vn] = {
-                "path": video_path,
-                "total_frames": meta["total_frames"],
-                "fps": meta["fps"],
-                "has_audio": meta["has_audio"],
-            }
-            self.controller.offsets[vn] = offsets.get(vn, 0)
-            self.controller.enabled_views.add(vn)
-            self._create_cell(vn, pos[0], pos[1])
-
-        self.controller.markers = markers
-        meta_data = data.get("metadata", {})
-        self.metadata = SessionMetadata.from_dict(meta_data)
-        self.metadata_bar.set_metadata(self.metadata)
-
-        self._backend_queue = list(self.cells.keys())
-        QTimer.singleShot(200, self._init_next_backend)
+        self._apply_session_data(data)
 
     # ---- 播放控制 ----
 
@@ -889,10 +849,12 @@ class MainWindow(QMainWindow):
     # ---- 保存 ----
 
     def _save(self):
-        if not self.controller.save():
+        if not self.controller.session_path:
             self._save_as()
         else:
-            self._write_extras_to_session()
+            data = self._collect_session_data()
+            save_session(self.controller.session_path, data)
+            self.controller.saved = True
 
     def _save_as(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -901,22 +863,81 @@ class MainWindow(QMainWindow):
         if path:
             if not path.endswith(".json"):
                 path += ".mvsp.json"
-            self.controller.save(path)
-            self._write_extras_to_session()
+            data = self._collect_session_data()
+            save_session(path, data)
+            self.controller.session_path = path
+            self.controller.saved = True
+            self._update_title()
 
-    def _write_extras_to_session(self):
-        sp = self.controller.session_path
-        if not sp or not Path(sp).exists():
-            return
-        try:
-            with open(sp, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            data["metadata"] = self.metadata.to_dict()
-            data["layout"] = self.layout_config.to_dict()
-            with open(sp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+    def _collect_session_data(self) -> SessionData:
+        """从当前 UI 状态采集 SessionData。"""
+        c = self.controller
+        cells = []
+        for vn, info in c.video_info.items():
+            cells.append({
+                "view_name": vn,
+                "video_path": info["path"],
+                "total_frames": info["total_frames"],
+                "fps": info["fps"],
+                "has_audio": info.get("has_audio", False),
+                "offset": c.offsets.get(vn, 0),
+            })
+        layout = self.layout_config.to_dict()
+        global_state = {
+            "version": "0.1.0",
+            "offsets": dict(c.offsets),
+            "markers": c.markers,
+            "metadata": self.metadata.to_dict(),
+        }
+        from datetime import datetime
+        global_state["created"] = datetime.now().isoformat(timespec="seconds")
+        return SessionData(cells=cells, layout=layout, global_state=global_state)
+
+    def _apply_session_data(self, data: SessionData):
+        """将 SessionData 应用到当前窗口。"""
+        if data.layout:
+            self.layout_config = LayoutConfig.from_dict(data.layout)
+            self._rebuild_view_maps()
+            self._populate_grid()
+
+        offsets = data.global_state.get("offsets", {})
+        markers = data.global_state.get("markers", [])
+
+        for cell in data.cells:
+            vn = cell["view_name"]
+            video_path = cell["video_path"]
+            if not video_path or not Path(video_path).exists():
+                print(f"[会话] 视频未找到，跳过: {video_path}")
+                continue
+            pos = self._view_positions.get(vn)
+            if pos is None:
+                for slot_vn in self._view_names:
+                    if slot_vn not in self.controller.video_info:
+                        pos = self._view_positions[slot_vn]
+                        vn = slot_vn
+                        break
+                if pos is None:
+                    continue
+            meta = probe_video_metadata(video_path)
+            if meta["total_frames"] <= 0:
+                continue
+            self.controller.video_info[vn] = {
+                "path": video_path,
+                "total_frames": meta["total_frames"],
+                "fps": meta["fps"],
+                "has_audio": meta["has_audio"],
+            }
+            self.controller.offsets[vn] = offsets.get(vn, 0)
+            self.controller.enabled_views.add(vn)
+            self._create_cell(vn, pos[0], pos[1])
+
+        self.controller.markers = markers
+        meta_data = data.global_state.get("metadata", {})
+        self.metadata = SessionMetadata.from_dict(meta_data)
+        self.metadata_bar.set_metadata(self.metadata)
+
+        self._backend_queue = list(self.cells.keys())
+        QTimer.singleShot(200, self._init_next_backend)
 
     # ---- 状态栏 / 标题 ----
 
