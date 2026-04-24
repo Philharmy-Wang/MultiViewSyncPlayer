@@ -195,13 +195,15 @@ def scan_library(library_root: Path) -> LibraryIndex:
                 # Build SubjectEntry from _meta.json
                 views: List[ViewEntry] = []
                 for vd in data.get("views", []):
+                    # video_path: relative to library root
+                    rel_video = Path(exp_name) / date_str / subj_dir.name / vd.get("video", "")
                     views.append(
                         ViewEntry(
                             name=vd.get("name", ""),
                             direction=vd.get("direction"),
                             index=vd.get("index"),
                             color=vd.get("color"),
-                            video_path=Path(vd.get("video", "")),
+                            video_path=rel_video,
                             notes=vd.get("notes", ""),
                         )
                     )

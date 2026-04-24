@@ -198,10 +198,16 @@ class MainWindow(QMainWindow):
             self.layout_config = LayoutConfig(rows=2, cols=3)
         self._rebuild_view_maps()
 
+        # 媒体库浏览器 dock（需在 _build_menubar 之前创建）
+        self.library_dock = LibraryBrowserDock(parent=self)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.library_dock)
+        self.library_dock.setVisible(False)
+
         self._build_menubar()
         self._build_ui()
         self._connect_signals()
         self._setup_shortcuts()
+        self._connect_library_dock()
 
         self.play_timer = QTimer(self)
         self.play_timer.setTimerType(Qt.PreciseTimer)
@@ -223,12 +229,6 @@ class MainWindow(QMainWindow):
 
         # 首次运行欢迎气泡
         QTimer.singleShot(500, self._show_welcome_if_first_run)
-
-        # 媒体库浏览器 dock
-        self.library_dock = LibraryBrowserDock(parent=self)
-        self.addDockWidget(Qt.LeftDockWidgetArea, self.library_dock)
-        self.library_dock.setVisible(False)
-        self._connect_library_dock()
 
     # ---- 菜单栏 ----
 
