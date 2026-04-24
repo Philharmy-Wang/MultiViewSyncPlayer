@@ -31,7 +31,11 @@ from .sync_controller import SyncController
 from .global_toolbar import GlobalToolbar
 from .video_cell import VideoCell, DraggableHeader
 from .metadata import SessionMetadata
-from .layout_manager import LayoutConfig
+from .layout_manager import LayoutConfig, fit_layout_to_views
+from .library.browser import LibraryBrowserDock
+from .library.import_wizard import ImportWizard
+from .library.executor import ImportExecutor
+from .library.schema import SubjectEntry, ViewEntry
 
 
 # ==================== 元数据栏 ====================
@@ -220,6 +224,12 @@ class MainWindow(QMainWindow):
         # 首次运行欢迎气泡
         QTimer.singleShot(500, self._show_welcome_if_first_run)
 
+        # 媒体库浏览器 dock
+        self.library_dock = LibraryBrowserDock(parent=self)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.library_dock)
+        self.library_dock.setVisible(False)
+        self._connect_library_dock()
+
     # ---- 菜单栏 ----
 
     def _build_menubar(self):
@@ -269,6 +279,14 @@ class MainWindow(QMainWindow):
         a.setShortcut("F11")
         a.triggered.connect(self._toggle_fullscreen)
         view_menu.addAction(a)
+
+        view_menu.addSeparator()
+
+        act_toggle_lib = QAction("显示/隐藏媒体库浏览器", self, checkable=True)
+        act_toggle_lib.setShortcut("Ctrl+L")
+        act_toggle_lib.toggled.connect(self.library_dock.setVisible)
+        self.library_dock.visibilityChanged.connect(act_toggle_lib.setChecked)
+        view_menu.addAction(act_toggle_lib)
 
         # 帮助菜单
         help_menu = menubar.addMenu("帮助(&H)")
@@ -1169,6 +1187,96 @@ class MainWindow(QMainWindow):
             a.setToolTip(p)
             a.triggered.connect(lambda _=False, pp=p: self._open_template_file(pp))
             self.recent_templates_menu.addAction(a)
+
+    # ---- 媒体库浏览器 ----
+
+    def _connect_library_dock(self):
+        d = self.library_dock
+        d.open_subject.connect(self._slot_open_subject)
+        d.open_view.connect(self._slot_open_view)
+        d.import_requested.connect(self._slot_import_requested)
+        d.library_root_changed.connect(self._slot_library_root_changed)
+
+    def _slot_open_subject(self, subject: SubjectEntry):
+        lib_root = self.library_dock.library_root()
+        if not lib_root:
+            return
+
+        views = self._sort_views_by_direction(subject.views)
+        n = len(views)
+
+        # 确保布局足够，然后完全重建
+        cfg = fit_layout_to_views(self.layout_config, n)
+        self._apply_layout_config(cfg)
+
+        # 按顺序将视角加载到 slot
+        loaded = []
+        for i, view in enumerate(views):
+            if i >= len(self._view_names):
+                break
+            vn = self._view_names[i]
+            abs_path = lib_root / view.video_path
+            if not abs_path.exists():
+                continue
+            meta = probe_video_metadata(str(abs_path))
+            if meta["total_frames"] <= 0:
+                continue
+            pos = self._view_positions.get(vn)
+            if pos is None:
+                continue
+            self.controller.video_info[vn] = {
+                "path": str(abs_path),
+                "total_frames": meta["total_frames"],
+                "fps": meta["fps"],
+                "has_audio": meta["has_audio"],
+            }
+            self.controller.offsets[vn] = 0
+            self.controller.enabled_views.add(vn)
+            self._create_cell(vn, pos[0], pos[1])
+            loaded.append(vn)
+
+        if loaded:
+            self._backend_queue = loaded
+            QTimer.singleShot(200, self._init_next_backend)
+        self._update_status()
+        self._update_title()
+
+    def _sort_views_by_direction(self, views):
+        order = {"front": 0, "back": 1, "left": 2, "right": 3,
+                 "top": 4, "bottom": 5}
+        return sorted(views,
+                      key=lambda v: (order.get(v.direction or "", 99),
+                                     v.index or 0))
+
+    def _slot_open_view(self, view: ViewEntry):
+        lib_root = self.library_dock.library_root()
+        if not lib_root:
+            return
+        abs_path = lib_root / view.video_path
+        if not abs_path.exists():
+            return
+        vn = self._find_empty_slot()
+        if vn is None:
+            vn = self._view_names[0] if self._view_names else None
+        if vn is None:
+            return
+        self._on_manual_video_selected(vn, str(abs_path))
+
+    def _find_empty_slot(self):
+        for vn in self._view_names:
+            if vn not in self.controller.video_info:
+                return vn
+        return None
+
+    def _slot_import_requested(self):
+        wizard = ImportWizard(parent=self)
+        if wizard.exec() == QDialog.Accepted:
+            plan = wizard.get_plan()
+            ImportExecutor(plan).run(dry_run=False)
+            self.library_dock.set_library_root(plan.library_root)
+
+    def _slot_library_root_changed(self, root):
+        self.setWindowTitle(f"多视角同步播放器 — [library: {root.name}]")
 
     # ---- 首次运行欢迎 ----
 
