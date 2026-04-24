@@ -32,7 +32,9 @@ from .global_toolbar import GlobalToolbar
 from .video_cell import VideoCell, DraggableHeader
 from .metadata import SessionMetadata
 from .layout_manager import LayoutConfig, fit_layout_to_views
-from .session_io import SessionData, save_session, load_session
+from .session_io import (
+    SessionData, save_session, load_session, detect_library_ref,
+)
 from .library.browser import LibraryBrowserDock
 from .library.import_wizard import ImportWizard
 from .library.executor import ImportExecutor
@@ -261,6 +263,13 @@ class MainWindow(QMainWindow):
         a = QAction("另存为...", self)
         a.triggered.connect(self._save_as)
         file_menu.addAction(a)
+
+        file_menu.addSeparator()
+
+        act_import = QAction("导入视频到库...", self)
+        act_import.setShortcut("Ctrl+I")
+        act_import.triggered.connect(self._slot_import_requested)
+        file_menu.addAction(act_import)
 
         # 视图菜单
         view_menu = menubar.addMenu("视图(&V)")
@@ -891,7 +900,18 @@ class MainWindow(QMainWindow):
         }
         from datetime import datetime
         global_state["created"] = datetime.now().isoformat(timespec="seconds")
-        return SessionData(cells=cells, layout=layout, global_state=global_state)
+
+        data = SessionData(cells=cells, layout=layout, global_state=global_state)
+        data.library_ref = detect_library_ref(
+            [c["video_path"] for c in cells if c.get("video_path")],
+            self._get_known_libraries(),
+        )
+        return data
+
+    def _get_known_libraries(self) -> list:
+        """返回当前已打开的 library root 列表。"""
+        root = self.library_dock.library_root()
+        return [root] if root else []
 
     def _apply_session_data(self, data: SessionData):
         """将 SessionData 应用到当前窗口。"""
@@ -938,6 +958,19 @@ class MainWindow(QMainWindow):
 
         self._backend_queue = list(self.cells.keys())
         QTimer.singleShot(200, self._init_next_backend)
+
+        # library_ref handling
+        if data.library_ref:
+            root = Path(data.library_ref["root"])
+            self._slot_library_root_changed(root)
+            self.library_dock.set_library_root(root)
+            self.library_dock.locate(
+                experiment=data.library_ref["experiment"],
+                date=data.library_ref["date"],
+                subject=data.library_ref["subject"],
+            )
+        else:
+            self.statusBar().showMessage("此 session 无库引用", 5000)
 
     # ---- 状态栏 / 标题 ----
 

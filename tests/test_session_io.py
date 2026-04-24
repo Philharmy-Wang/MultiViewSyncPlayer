@@ -10,6 +10,7 @@ from multiview_sync_player.session_io import (
     SESSION_VERSION,
     SessionData,
     SessionFormatError,
+    detect_library_ref,
     load_session,
     save_session,
 )
@@ -140,3 +141,79 @@ class TestUnicode:
         raw = path.read_text(encoding="utf-8")
         assert "前侧" in raw
         assert "备注" in raw
+
+
+# ---------------------------------------------------------------------------
+# library_ref tests (Step 8b)
+# ---------------------------------------------------------------------------
+
+class TestLibraryRef:
+    def test_save_with_library_ref(self, tmp_path):
+        """SessionData.library_ref 非空 → save → load → 字段全等。"""
+        path = tmp_path / "with_lib.mvsp.json"
+        lib_ref = {
+            "root": "/data/library",
+            "experiment": "ThreeChamber",
+            "date": "2026-01-26",
+            "subject": "24332",
+        }
+        original = _sample_data()
+        original.library_ref = lib_ref
+        save_session(path, original)
+
+        loaded = load_session(path)
+        assert loaded.library_ref == lib_ref
+
+    def test_load_legacy_no_library_ref(self, tmp_path):
+        """旧格式 JSON（无 library_ref 键）→ load 成功 + library_ref is None。"""
+        path = tmp_path / "legacy.mvsp.json"
+        path.write_text(json.dumps({
+            "version": SESSION_VERSION,
+            "videos": {"View 1": {"path": "/a.mp4", "total_frames": 100,
+                                  "fps": 30.0, "has_audio": False}},
+            "offsets": {"View 1": 0},
+            "markers": [],
+        }), encoding="utf-8")
+
+        loaded = load_session(path)
+        assert loaded.library_ref is None
+
+
+class TestDetectLibraryRef:
+    def test_detect_library_ref_hit(self, tmp_path):
+        """所有 video_paths 位于同一 subject 目录 → detect 命中。"""
+        lib_root = tmp_path / "lib"
+        exp_dir = lib_root / "ThreeChamber" / "2026-01-26" / "24332"
+        exp_dir.mkdir(parents=True)
+
+        paths = [
+            str(exp_dir / "front.mp4"),
+            str(exp_dir / "top.mp4"),
+        ]
+        result = detect_library_ref(paths, [lib_root])
+        assert result is not None
+        assert result["experiment"] == "ThreeChamber"
+        assert result["date"] == "2026-01-26"
+        assert result["subject"] == "24332"
+
+    def test_detect_library_ref_miss_cross_subject(self, tmp_path):
+        """video_paths 跨 subject → detect 返回 None。"""
+        lib_root = tmp_path / "lib"
+        dir1 = lib_root / "Exp" / "2026-01-01" / "subj1"
+        dir2 = lib_root / "Exp" / "2026-01-01" / "subj2"
+        dir1.mkdir(parents=True)
+        dir2.mkdir(parents=True)
+
+        paths = [str(dir1 / "a.mp4"), str(dir2 / "b.mp4")]
+        result = detect_library_ref(paths, [lib_root])
+        assert result is None
+
+    def test_detect_library_ref_miss_outside_library(self, tmp_path):
+        """video_paths 不在任何 known library 下 → detect 返回 None。"""
+        other = tmp_path / "somewhere" / "else.mp4"
+        paths = [str(other)]
+        lib_root = tmp_path / "lib"
+        lib_root.mkdir()
+
+        result = detect_library_ref(paths, [lib_root])
+        assert result is None

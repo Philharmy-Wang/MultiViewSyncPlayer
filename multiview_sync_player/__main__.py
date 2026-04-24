@@ -19,6 +19,8 @@ def main():
         description='Multi-view video synchronized playback & alignment tool')
     parser.add_argument('--session', type=str, default=None,
                         help='Open a saved .mvsp.json session file')
+    parser.add_argument('--library', type=str, default=None,
+                        help='Open a media library root directory on startup')
     parser.add_argument('--backend', default='opencv',
                         choices=['opencv', 'mpv'],
                         help='Video decode backend (default: opencv)')
@@ -38,6 +40,9 @@ def main():
     app.setStyle('Fusion')
 
     from .main_window import MainWindow
+    from pathlib import Path
+
+    win = None
 
     if args.session:
         # Direct session load, skip LaunchDialog
@@ -55,6 +60,13 @@ def main():
             win.show()
         else:
             sys.exit(0)
+
+    if win and args.library:
+        lib_path = Path(args.library)
+        if lib_path.is_dir():
+            win._slot_library_root_changed(lib_path)
+            win.library_dock.set_library_root(lib_path)
+            win.library_dock.setVisible(True)
 
     sys.exit(app.exec())
 

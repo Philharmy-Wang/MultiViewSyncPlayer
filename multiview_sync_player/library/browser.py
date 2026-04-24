@@ -259,6 +259,56 @@ class LibraryBrowserDock(QDockWidget):
     def library_root(self) -> Optional[Path]:
         return self._library_root
 
+    def locate(self, experiment: str, date: str, subject: str) -> bool:
+        """在 tree 中展开并选中对应 subject 节点。
+
+        命中返回 True，未命中返回 False（不抛错）。
+        """
+        if not self._model:
+            return False
+
+        # Walk the model: root → experiment → date → subject
+        root = self._model.invisibleRootItem()
+        for exp_row in range(root.rowCount()):
+            exp_item = root.child(exp_row)
+            exp_entry = exp_item.data(_NODE_ENTRY_ROLE)
+            if not isinstance(exp_entry, ExperimentEntry):
+                continue
+            if exp_entry.name != experiment:
+                continue
+
+            for date_row in range(exp_item.rowCount()):
+                date_item = exp_item.child(date_row)
+                date_entry = date_item.data(_NODE_ENTRY_ROLE)
+                if not isinstance(date_entry, DateEntry):
+                    continue
+                if date_entry.date.isoformat() != date:
+                    continue
+
+                for subj_row in range(date_item.rowCount()):
+                    subj_item = date_item.child(subj_row)
+                    subj_entry = subj_item.data(_NODE_ENTRY_ROLE)
+                    if not isinstance(subj_entry, SubjectEntry):
+                        continue
+                    if subj_entry.subject_id != subject:
+                        continue
+
+                    # Found — map through proxy and select
+                    src_idx = self._model.indexFromItem(subj_item)
+                    proxy_idx = self._proxy.mapFromSource(src_idx)
+
+                    # Expand parent chain
+                    parent_proxy = proxy_idx.parent()
+                    while parent_proxy.isValid():
+                        self._tree.expand(parent_proxy)
+                        parent_proxy = parent_proxy.parent()
+                    self._tree.expand(proxy_idx.parent())
+
+                    self._tree.setCurrentIndex(proxy_idx)
+                    self._tree.scrollTo(proxy_idx)
+                    return True
+        return False
+
     def current_index(self) -> Optional[LibraryIndex]:
         return self._index
 

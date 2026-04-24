@@ -46,6 +46,10 @@ class SessionData:
     global_state: dict = field(default_factory=dict)
     # {version, created, offsets, markers, metadata}
 
+    library_ref: Optional[dict] = None
+    # {'root': abs_path, 'experiment': '...', 'date': 'YYYY-MM-DD',
+    #  'subject': '...'}  — None when absent (backward-compatible).
+
     extra: dict = field(default_factory=dict)
     # Any additional top-level keys not covered above.
 
@@ -100,6 +104,10 @@ def save_session(path: Path, data: SessionData) -> None:
     # extra keys
     obj.update(data.extra)
 
+    # library_ref (omit when None for backward compatibility)
+    if data.library_ref is not None:
+        obj["library_ref"] = data.library_ref
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
@@ -153,12 +161,74 @@ def load_session(path: Path) -> SessionData:
 
     # Collect any unknown top-level keys as extra
     known = {"version", "created", "offsets", "markers",
-             "videos", "metadata", "layout"}
+             "videos", "metadata", "layout", "library_ref"}
     extra = {k: v for k, v in obj.items() if k not in known}
+
+    # library_ref (backward-compatible: None if absent)
+    library_ref = obj.get("library_ref")
 
     return SessionData(
         cells=cells,
         layout=layout,
         global_state=global_state,
+        library_ref=library_ref,
         extra=extra,
     )
+
+
+# ---------------------------------------------------------------------------
+# Library-ref detection
+# ---------------------------------------------------------------------------
+
+def detect_library_ref(
+    video_paths: list[str],
+    known_libraries: list[Path],
+) -> Optional[dict]:
+    """Check whether all *video_paths* share the same library root and the
+    same experiment/date/subject triple under that root.
+
+    Returns a dict ``{root, experiment, date, subject}`` on match, or
+    ``None`` if the paths are scattered across libraries / subjects or do
+    not fall under any known library.
+    """
+    if not video_paths or not known_libraries:
+        return None
+
+    # Normalise library roots to absolute resolved paths
+    lib_roots = [Path(p).resolve() for p in known_libraries]
+
+    matched_root: Optional[Path] = None
+    matched_parts: Optional[tuple] = None  # (experiment, date, subject)
+
+    for vp in video_paths:
+        p = Path(vp).resolve()
+        found = False
+        for root in lib_roots:
+            try:
+                rel = p.relative_to(root)
+            except ValueError:
+                continue
+            parts = rel.parts
+            # Expect at least experiment/date/subject/file
+            if len(parts) < 4:
+                continue
+            exp, date, subj = parts[0], parts[1], parts[2]
+            if matched_root is None:
+                matched_root = root
+                matched_parts = (exp, date, subj)
+            elif matched_root != root or matched_parts != (exp, date, subj):
+                return None  # cross-library or cross-subject
+            found = True
+            break
+        if not found:
+            return None  # outside any known library
+
+    if matched_root is None or matched_parts is None:
+        return None
+
+    return {
+        "root": str(matched_root),
+        "experiment": matched_parts[0],
+        "date": matched_parts[1],
+        "subject": matched_parts[2],
+    }
