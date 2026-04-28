@@ -15,7 +15,12 @@ dist/
 
 # PyInstaller
 *.manifest
-*.spec
+*.spec.bak
+!packaging/*.spec
+
+# Packaging binaries (not tracked in git)
+packaging/bin/
+packaging/_ffmpeg*
 
 # Installer logs
 pip-log.txt
