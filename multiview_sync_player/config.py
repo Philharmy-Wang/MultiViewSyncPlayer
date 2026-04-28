@@ -30,6 +30,12 @@ BACKEND = "opencv"
 
 def _find_ffmpeg() -> str:
     """Locate ffmpeg executable."""
+    # 0. PyInstaller frozen bundle (_internal/bin/ffmpeg.exe)
+    if getattr(sys, 'frozen', False):
+        base = Path(sys._MEIPASS)
+        candidate = base / "bin" / "ffmpeg.exe"
+        if candidate.is_file():
+            return str(candidate)
     # 1. System PATH
     p = shutil.which("ffmpeg")
     if p:
