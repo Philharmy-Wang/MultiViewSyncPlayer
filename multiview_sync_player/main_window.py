@@ -670,9 +670,14 @@ class MainWindow(QMainWindow):
 
         self._seek_timeout_timer.start(SEEK_TIMEOUT_MS)
         for view, target in targets.items():
+            participants[view].set_seek_pending(True)
             participants[view].seek_to_frame(
                 target, request_id=request.generation)
         self._update_status()
+
+    def _set_all_seek_pending(self, pending):
+        for cell in self.cells.values():
+            cell.set_seek_pending(pending)
 
     def _on_seek_frame_ready(self, view, generation, frame_number, image):
         complete = self._seek_barrier.accept(
@@ -685,6 +690,7 @@ class MainWindow(QMainWindow):
         if request is None:
             return
         self._seek_timeout_timer.stop()
+        self._set_all_seek_pending(False)
         self._last_seek_latency_ms = request.latency_ms
 
         # All QPixmap/overlay/slider writes happen in this one UI callback.
@@ -722,6 +728,7 @@ class MainWindow(QMainWindow):
         self._last_seek_error = (
             "Seek timeout after retry: " + ", ".join(missing))
         self._seek_barrier.cancel(request.generation)
+        self._set_all_seek_pending(False)
         self._update_status()
 
     def _toggle_debug_metrics(self, visible):

@@ -7,8 +7,10 @@ main thread pulls frames non-blocking via get_frame().
 Also contains video metadata probing utility.
 """
 
+import bisect
 import collections
 import ctypes
+import subprocess
 import sys
 import threading
 from time import perf_counter
@@ -23,6 +25,8 @@ from .config import (
     DECODE_BUFFER_SIZE,
     RECENT_FRAME_CACHE_SIZE,
     SEQUENTIAL_STEP_WINDOW,
+    FFPROBE_PATH,
+    SEEK_KEYFRAME_DECODE_MARGIN,
 )
 
 
@@ -86,6 +90,68 @@ def probe_video_metadata(video_path: str) -> dict:
 
 
 # ==================== Ring-buffer prefetch decoder ====================
+
+# path -> sorted keyframe frame-number list (shared across decoder threads)
+_KEYFRAME_INDEX_CACHE = {}
+
+
+def probe_keyframe_index(video_path, fps: float) -> list:
+    """Return sorted keyframe frame numbers via ffprobe packet scan.
+
+    Frame numbers are derived from packet PTS: floor((pts - start_pts) * fps),
+    deliberately floored (never rounded up) so an anchor seek never starts
+    *after* the real keyframe. Returns [] when ffprobe is unavailable or the
+    stream cannot be indexed. Results are cached per video path.
+    """
+    from pathlib import Path
+    path = Path(video_path)
+    cached = _KEYFRAME_INDEX_CACHE.get(str(path))
+    if cached is not None:
+        return cached
+    index = []
+    if FFPROBE_PATH and fps > 0:
+        try:
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            proc = subprocess.run(
+                [FFPROBE_PATH, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "packet=flags,pts_time",
+                 "-of", "csv=p=0", str(path)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=120, creationflags=creationflags)
+            lines = proc.stdout.decode("ascii", errors="ignore").splitlines()
+            start_pts = None
+            for line in lines:
+                parts = line.split(",")
+                pts = None
+                flags = ""
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    try:
+                        value = float(part)
+                    except ValueError:
+                        flags = part
+                    else:
+                        if pts is None:
+                            pts = value
+                if pts is None:
+                    continue
+                if start_pts is None:
+                    start_pts = pts
+                if flags.startswith("K"):
+                    frame_number = int((pts - start_pts) * fps)
+                    if frame_number < 0:
+                        frame_number = 0
+                    if not index or frame_number > index[-1]:
+                        index.append(frame_number)
+        except Exception:
+            index = []
+    _KEYFRAME_INDEX_CACHE[str(path)] = index
+    return index
+
 
 class PrefetchDecoder(QThread):
     """Generation-aware ring-buffer decoder with a recent-frame cache."""
@@ -157,6 +223,10 @@ class PrefetchDecoder(QThread):
         self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         self._current_pos = 0
+        # Keyframe index for reference-safe random seeks (HEVC/H.264):
+        # a raw cap.set() into mid-GOP decodes P/B frames without their
+        # references and yields gray/corrupt frames until the next keyframe.
+        self._keyframes = probe_keyframe_index(self._video_path, self.fps)
 
         try:
             while True:
@@ -180,6 +250,15 @@ class PrefetchDecoder(QThread):
         finally:
             cap.release()
 
+    def _keyframe_anchor(self, target: int):
+        """Largest keyframe frame number <= target, or None without index."""
+        if not self._keyframes:
+            return None
+        idx = bisect.bisect_right(self._keyframes, target) - 1
+        if idx < 0:
+            return None
+        return self._keyframes[idx]
+
     def _decode_request(self, cap, request):
         request_id, target, requested_at = request
         if self.total_frames <= 0:
@@ -192,11 +271,34 @@ class PrefetchDecoder(QThread):
         sequential = (current_pos <= target
                       and target - current_pos <= SEQUENTIAL_STEP_WINDOW)
         if not sequential:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-            current_pos = target
+            # Anchor random seeks at a keyframe so decoding always starts
+            # with a complete reference chain, then fast-forward to the
+            # target with grab() (no convert/cache cost), keeping the last
+            # SEEK_KEYFRAME_DECODE_MARGIN frames as cached reads.
+            anchor = self._keyframe_anchor(target)
+            if anchor is None:
+                anchor = target
+            cap.set(cv2.CAP_PROP_POS_FRAMES, anchor)
+            current_pos = anchor
             with self._condition:
-                self._current_pos = target
+                self._current_pos = anchor
                 self._random_seeks += 1
+            grab_stop = max(anchor, target - SEEK_KEYFRAME_DECODE_MARGIN)
+            while current_pos < grab_stop:
+                if not cap.grab():
+                    with self._condition:
+                        is_latest = request_id == self._latest_request_id
+                    if is_latest:
+                        self.frame_failed.emit(
+                            request_id, target,
+                            f"decode failed at frame {current_pos}")
+                    return
+                current_pos += 1
+                with self._condition:
+                    self._current_pos = current_pos
+                    self._decoded_frames += 1
+                    if request_id != self._latest_request_id:
+                        return
 
         while current_pos <= target:
             ret, frame = cap.read()

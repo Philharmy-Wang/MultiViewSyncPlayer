@@ -112,6 +112,7 @@ class OverlayWidget(QWidget):
         self.is_selected = False
         self.is_enabled = True
         self.synced = True
+        self.seek_pending = False
         self.setMouseTracking(True)
 
     def paintEvent(self, event):
@@ -133,9 +134,11 @@ class OverlayWidget(QWidget):
         painter.setFont(font)
         fm = painter.fontMetrics()
 
-        # Border
+        # Border (lightweight seek hint: orange border, no occlusion)
         if self.is_selected:
             bc = QColor(COLOR_ACCENT)
+        elif self.seek_pending:
+            bc = QColor(255, 152, 0)
         elif not self.synced:
             bc = QColor(255, 152, 0)
         else:
@@ -222,6 +225,14 @@ class VideoDisplay(QWidget):
         self.setStyleSheet("background: #1a1a1a;")
 
     def set_pixmap(self, pixmap):
+        """Display a pixmap; keeps the last good frame on None/invalid.
+
+        The video area must never be cleared to a gray/black placeholder
+        while a seek is pending — the previous frame stays visible until
+        the new frame is committed atomically.
+        """
+        if pixmap is None or pixmap.isNull():
+            return
         self._pixmap = pixmap
         self._cached_scaled = None
         self.update()
@@ -278,6 +289,7 @@ class VideoCell(QWidget):
         self.is_enabled = True
         self.has_audio = False
         self._pixmap = None
+        self._last_good_pixmap = None
         self.synced = True
         self.grid_pos = (-1, -1)
         self.view_color = ""
@@ -494,8 +506,11 @@ class VideoCell(QWidget):
         """Main thread: display QImage to VideoDisplay.
         fast=True skips non-critical UI updates (throttled during playback).
         """
+        if qimg is None or qimg.isNull():
+            return  # keep last good frame visible
         pixmap = QPixmap.fromImage(qimg)
         self._pixmap = pixmap
+        self._last_good_pixmap = pixmap
         self.current_frame = frame_idx
 
         if fast:
@@ -563,6 +578,10 @@ class VideoCell(QWidget):
 
     def set_selected(self, selected: bool):
         self.overlay.is_selected = selected
+        self.overlay.update()
+
+    def set_seek_pending(self, pending: bool):
+        self.overlay.seek_pending = pending
         self.overlay.update()
 
     def set_offset(self, offset: int):

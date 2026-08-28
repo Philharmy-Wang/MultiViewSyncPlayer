@@ -61,12 +61,36 @@ def _find_ffmpeg() -> str:
 
 FFMPEG_PATH = _find_ffmpeg()
 
+
+def _find_ffprobe() -> str:
+    """Locate ffprobe executable (used to build keyframe indexes)."""
+    # 0. Next to the resolved ffmpeg (bundle / portable layout)
+    if FFMPEG_PATH and os.path.isfile(FFMPEG_PATH):
+        candidate = Path(FFMPEG_PATH).with_name("ffprobe.exe")
+        if candidate.is_file():
+            return str(candidate)
+    # 1. Source tree packaging/bin (dev checkout)
+    candidate = Path(__file__).resolve().parents[1] / "packaging" / "bin" / "ffprobe.exe"
+    if candidate.is_file():
+        return str(candidate)
+    # 2. System PATH
+    p = shutil.which("ffprobe")
+    if p:
+        return p
+    return ""
+
+
+FFPROBE_PATH = _find_ffprobe()
+
 # ---- OpenCV backend params ----
 DECODE_TARGET_WIDTH = 720
 DECODE_BUFFER_SIZE = 60   # ring buffer prefetch size
 RECENT_FRAME_CACHE_SIZE = 64
 SEQUENTIAL_STEP_WINDOW = 16
 SEEK_TIMEOUT_MS = 2000
+# After a keyframe-anchored random seek, the last N frames before the
+# target are decoded with full read+cache; the bulk is grab()-skipped.
+SEEK_KEYFRAME_DECODE_MARGIN = 8
 
 # ---- Color scheme (DaVinci Resolve style) ----
 COLOR_WINDOW_BG = "#1e1e1e"
