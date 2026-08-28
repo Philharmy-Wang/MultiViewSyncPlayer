@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
+from time import perf_counter
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox,
@@ -21,13 +22,15 @@ from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QSettings
 from PySide6.QtGui import QShortcut, QKeySequence, QAction
 
 from .config import (
-    SPEED_STEPS, PLAYER_CONFIG_PATH, DEFAULT_FPS, BACKEND,
+    SPEED_STEPS, PLAYER_CONFIG_PATH, SEEK_TIMEOUT_MS,
     COLOR_PANEL_BG, COLOR_ACCENT, COLOR_TEXT, COLOR_TEXT_DIM,
     VIEW_COLORS,
 )
+from . import config as cfg
 from .styles import DARK_THEME_QSS
 from .video_decoder import probe_video_metadata
 from .sync_controller import SyncController
+from .playback_sync import SeekBarrier
 from .global_toolbar import GlobalToolbar
 from .video_cell import VideoCell, DraggableHeader
 from .metadata import SessionMetadata
@@ -186,10 +189,17 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1200, 800)
         self.resize(1600, 900)
 
-        from . import config as cfg
         cfg.BACKEND = backend
 
         self.controller = SyncController()
+        self._seek_barrier = SeekBarrier()
+        self._last_seek_latency_ms = 0.0
+        self._last_seek_error = ""
+        self._playback_stall_ticks = 0
+        self._displayed_ticks = 0
+        self._play_started_at = None
+        self._fps_warning = ""
+        self._backend_init_complete = True
         self.metadata = SessionMetadata()
         self.cells = {}
         self._slot_widgets = {}
@@ -222,6 +232,10 @@ class MainWindow(QMainWindow):
 
         self.sync_timer = QTimer(self)
         self.sync_timer.timeout.connect(self._sync_correction)
+
+        self._seek_timeout_timer = QTimer(self)
+        self._seek_timeout_timer.setSingleShot(True)
+        self._seek_timeout_timer.timeout.connect(self._on_seek_timeout)
 
         self._restore_geometry()
 
@@ -298,6 +312,13 @@ class MainWindow(QMainWindow):
         self.library_dock.visibilityChanged.connect(act_toggle_lib.setChecked)
         view_menu.addAction(act_toggle_lib)
 
+        view_menu.addSeparator()
+        self.debug_metrics_action = QAction(
+            "Debug playback metrics", self, checkable=True)
+        self.debug_metrics_action.toggled.connect(
+            self._toggle_debug_metrics)
+        view_menu.addAction(self.debug_metrics_action)
+
         # 帮助菜单
         help_menu = menubar.addMenu("帮助(&H)")
 
@@ -344,6 +365,14 @@ class MainWindow(QMainWindow):
         self._populate_grid()
 
         ml.addWidget(self.grid_widget, 1)
+
+        self.debug_metrics_label = QLabel()
+        self.debug_metrics_label.setWordWrap(True)
+        self.debug_metrics_label.setStyleSheet(
+            "background:#111; color:#9ee7ff; font-family:Consolas; "
+            "font-size:8pt; padding:4px;")
+        self.debug_metrics_label.setVisible(False)
+        ml.addWidget(self.debug_metrics_label)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -499,12 +528,16 @@ class MainWindow(QMainWindow):
         self.toolbar.set_play_button_text(playing)
         if playing:
             speed = SPEED_STEPS[self.controller.speed_index]
-            interval = max(16, int(1000 / (DEFAULT_FPS * speed)))
-            for cell in self.cells.values():
+            participants = self._synced_enabled_cells()
+            fps = self.controller.master_fps(participants)
+            interval = max(1, round(1000 / (fps * speed)))
+            self._play_started_at = perf_counter()
+            self._displayed_ticks = 0
+            for cell in participants.values():
                 if cell.synced:
                     cell.play()
                     cell.set_speed(speed)
-            QTimer.singleShot(150, lambda: self._start_display_timer(interval))
+            QTimer.singleShot(50, lambda: self._start_display_timer(interval))
             self._ui_timer.start(200)
             self.sync_timer.start(200)
         else:
@@ -523,32 +556,47 @@ class MainWindow(QMainWindow):
     def _on_play_tick(self):
         if not self.controller.is_playing:
             return
-        self.controller.base_frame += 1
-        self.controller.saved = False
-        for vn, cell in self.cells.items():
-            if not cell.synced or not self.controller.is_view_enabled(vn):
-                continue
-            target = self.controller.base_frame + self.controller.offsets.get(vn, 0)
+        if self.controller.base_frame >= self.controller._max_base_frame():
+            self.controller.pause()
+            return
+
+        participants = self._synced_enabled_cells()
+        next_base = self.controller.base_frame + 1
+        targets = {
+            view: self.controller.get_target_frame_at(view, next_base)
+            for view in participants
+        }
+
+        # Strict admission: no view consumes or displays until all are ready.
+        for view, cell in participants.items():
+            if cell.decoder and not cell.decoder.has_frame(targets[view]):
+                self._playback_stall_ticks += 1
+                return
+
+        frames = {}
+        for view, cell in participants.items():
             if cell.decoder:
-                qimg = cell.decoder.get_frame(target)
-                if qimg:
-                    cell.display_image(qimg, target, fast=True)
+                image = cell.decoder.get_frame(targets[view])
+                if image is None:
+                    self._playback_stall_ticks += 1
+                    return
+                frames[view] = image
+
+        self.controller.base_frame = next_base
+        self.controller.saved = False
+        for view, image in frames.items():
+            participants[view].display_image(image, targets[view])
+        for cell in participants.values():
+            cell.waveform.set_base_frame(next_base)
+        self._displayed_ticks += 1
 
     def _on_ui_refresh(self):
         if not self.controller.is_playing:
             return
         base = self.controller.base_frame
-        for vn, cell in self.cells.items():
-            if not cell.synced or not self.controller.is_view_enabled(vn):
-                continue
-            target = base + self.controller.offsets.get(vn, 0)
-            cell.overlay.current_frame = target
-            cell.overlay.update()
-            cell.slider.blockSignals(True)
-            cell.slider.setValue(target)
-            cell.slider.blockSignals(False)
-            cell._update_time_label(target)
+        for cell in self._synced_enabled_cells().values():
             cell.waveform.set_base_frame(base)
+        self._update_debug_metrics()
         self._update_status()
         self._update_title()
 
@@ -557,9 +605,11 @@ class MainWindow(QMainWindow):
         self.toolbar.highlight_speed(idx)
         speed = SPEED_STEPS[idx]
         if self.controller.is_playing:
+            participants = self._synced_enabled_cells()
+            fps = self.controller.master_fps(participants)
             self.play_timer.setInterval(
-                max(16, int(1000 / (DEFAULT_FPS * speed))))
-            for cell in self.cells.values():
+                max(1, round(1000 / (fps * speed))))
+            for cell in participants.values():
                 if cell.synced:
                     cell.set_speed(speed)
 
@@ -570,7 +620,7 @@ class MainWindow(QMainWindow):
         self.controller.step_frames(delta)
 
     def _sync_correction(self):
-        if BACKEND != "mpv":
+        if cfg.BACKEND != "mpv":
             return
         for vn, cell in self.cells.items():
             if (cell.player and cell.is_enabled and cell.synced
@@ -586,20 +636,150 @@ class MainWindow(QMainWindow):
     # ---- 帧偏移更新 ----
 
     def _on_base_frame_changed(self, frame):
-        for vn, cell in self.cells.items():
-            if cell.synced and self.controller.is_view_enabled(vn):
-                target = frame + self.controller.offsets.get(vn, 0)
-                cell.seek_to_frame(target)
-                cell.update_overlay_for_base(frame)
-            elif cell.synced:
-                cell.waveform.set_base_frame(frame)
-        self._update_status()
+        if self.controller.is_playing:
+            self.controller.pause()
+            return
+        self._begin_seek_request(frame)
         self._update_title()
 
     def _on_offset_changed(self, view, offset):
         if view in self.cells:
             self.cells[view].set_offset(offset)
         self._on_base_frame_changed(self.controller.base_frame)
+
+    def _synced_enabled_cells(self):
+        return {
+            view: cell for view, cell in self.cells.items()
+            if cell.synced and self.controller.is_view_enabled(view)
+        }
+
+    def _begin_seek_request(self, base_frame, retry_count=0):
+        participants = self._synced_enabled_cells()
+        targets = {
+            view: self.controller.get_target_frame_at(view, base_frame)
+            for view in participants
+        }
+        request = self._seek_barrier.begin(
+            base_frame, targets, retry_count=retry_count)
+        self._last_seek_error = ""
+
+        if not targets:
+            self._seek_barrier.cancel(request.generation)
+            self._update_status()
+            return
+
+        self._seek_timeout_timer.start(SEEK_TIMEOUT_MS)
+        for view, target in targets.items():
+            participants[view].seek_to_frame(
+                target, request_id=request.generation)
+        self._update_status()
+
+    def _on_seek_frame_ready(self, view, generation, frame_number, image):
+        complete = self._seek_barrier.accept(
+            generation, view, frame_number, image)
+        if not complete:
+            self._update_status()
+            return
+
+        request = self._seek_barrier.finish(generation)
+        if request is None:
+            return
+        self._seek_timeout_timer.stop()
+        self._last_seek_latency_ms = request.latency_ms
+
+        # All QPixmap/overlay/slider writes happen in this one UI callback.
+        for participant, target in request.targets.items():
+            cell = self.cells.get(participant)
+            image = request.frames.get(participant)
+            if cell is None:
+                continue
+            if image is not None:
+                cell.display_image(image, target)
+            cell.waveform.set_base_frame(request.base_frame)
+        for cell in self.cells.values():
+            if cell.synced and not cell.is_enabled:
+                cell.waveform.set_base_frame(request.base_frame)
+        self._update_debug_metrics()
+        self._update_status()
+        self._update_title()
+
+    def _on_seek_frame_failed(self, view, generation, frame_number, message):
+        request = self._seek_barrier.active
+        if request is None or request.generation != generation:
+            return
+        self._last_seek_error = f"{view} frame {frame_number}: {message}"
+        self._update_status()
+
+    def _on_seek_timeout(self):
+        request = self._seek_barrier.active
+        if request is None:
+            return
+        missing = request.missing_views
+        base = request.base_frame
+        if request.retry_count < 1:
+            self._begin_seek_request(base, retry_count=request.retry_count + 1)
+            return
+        self._last_seek_error = (
+            "Seek timeout after retry: " + ", ".join(missing))
+        self._seek_barrier.cancel(request.generation)
+        self._update_status()
+
+    def _toggle_debug_metrics(self, visible):
+        self.debug_metrics_label.setVisible(visible)
+        if visible:
+            self._update_debug_metrics()
+
+    def _update_debug_metrics(self):
+        if not hasattr(self, "debug_metrics_label"):
+            return
+        participants = self._synced_enabled_cells()
+        master = self.controller.master_view(participants) or "--"
+        fps = self.controller.master_fps(participants)
+        speed = SPEED_STEPS[self.controller.speed_index]
+        elapsed = ((perf_counter() - self._play_started_at)
+                   if self._play_started_at else 0.0)
+        effective_fps = self._displayed_ticks / elapsed if elapsed > 0 else 0.0
+        lines = [
+            f"Backend={cfg.BACKEND} Mode=Strict Master={master} "
+            f"FPS={fps:.3f} Base={self.controller.base_frame} "
+            f"Speed={speed:.2f}x Effective={effective_fps:.2f}fps "
+            f"Stalls={self._playback_stall_ticks} "
+            f"Seek={self._last_seek_latency_ms:.1f}ms",
+        ]
+        for view, cell in participants.items():
+            target = self.controller.get_target_frame(view)
+            if cell.decoder:
+                metrics = cell.decoder.metrics()
+                lines.append(
+                    f"{view}: target={target} displayed={cell.current_frame} "
+                    f"lag={target-cell.current_frame:+d} "
+                    f"buffer={metrics['buffer_occupancy']}/"
+                    f"{metrics['buffer_capacity']} cache="
+                    f"{metrics['cache_occupancy']}/{metrics['cache_capacity']} "
+                    f"decoder={metrics['decoder_position']} "
+                    f"seek={metrics['seek_latency_ms']:.1f}ms")
+            else:
+                lines.append(
+                    f"{view}: target={target} displayed={cell.current_frame}")
+        if self._fps_warning:
+            lines.append(self._fps_warning)
+        if self._last_seek_error:
+            lines.append("ERROR: " + self._last_seek_error)
+        self.debug_metrics_label.setText("\n".join(lines))
+
+    def _refresh_fps_warning(self):
+        participants = self._synced_enabled_cells()
+        mismatches = self.controller.fps_mismatches(participants)
+        if not mismatches:
+            self._fps_warning = ""
+            return
+        master = self.controller.master_view(participants)
+        master_fps = self.controller.master_fps(participants)
+        detail = ", ".join(
+            f"{view}={fps:.3f}" for view, fps in mismatches.items())
+        self._fps_warning = (
+            f"FPS WARNING: master {master}={master_fps:.3f}; {detail}. "
+            "Strict frame mode remains enabled; time drift may accumulate.")
 
     # ---- 手动选视频 ----
 
@@ -636,10 +816,12 @@ class MainWindow(QMainWindow):
         cell.position_jump.connect(self.controller.seek_to)
         cell.solo_stepping.connect(
             lambda vn, d: self.controller.adjust_offset(vn, d))
-        cell.enable_toggled.connect(self.controller.set_view_enabled)
+        cell.enable_toggled.connect(self._on_view_enabled)
         cell.sync_toggled.connect(self._on_sync_toggled)
         cell.solo_position_jump.connect(self._on_solo_position_jump)
         cell.video_file_selected.connect(self._on_manual_video_selected)
+        cell.seek_frame_ready.connect(self._on_seek_frame_ready)
+        cell.seek_frame_failed.connect(self._on_seek_frame_failed)
         cell.waveform.position_clicked.connect(self.controller.seek_to)
         cell.grid_pos = (row, col)
         linear_idx = row * self.layout_config.cols + col
@@ -694,10 +876,14 @@ class MainWindow(QMainWindow):
             cell.set_offset(self.controller.offsets.get(view_name, 0))
             cell.waveform.set_video_meta(info["fps"], info["total_frames"])
             cell.waveform.set_offset(self.controller.offsets.get(view_name, 0))
+            self._refresh_fps_warning()
+            self._on_base_frame_changed(self.controller.base_frame)
 
     def _init_next_backend(self):
         if not self._backend_queue:
+            self._backend_init_complete = True
             self.controller.base_frame = 0
+            self._refresh_fps_warning()
             self._on_base_frame_changed(0)
             self._start_audio_loading()
             self._update_title()
@@ -735,11 +921,13 @@ class MainWindow(QMainWindow):
     # ---- 同步锁回调 ----
 
     def _on_sync_toggled(self, view_name, synced):
-        if synced:
-            frame = self.controller.base_frame
-            target = frame + self.controller.offsets.get(view_name, 0)
-            self.cells[view_name].seek_to_frame(target)
-            self.cells[view_name].update_overlay_for_base(frame)
+        self._refresh_fps_warning()
+        self._on_base_frame_changed(self.controller.base_frame)
+
+    def _on_view_enabled(self, view_name, enabled):
+        self.controller.set_view_enabled(view_name, enabled)
+        self._refresh_fps_warning()
+        self._on_base_frame_changed(self.controller.base_frame)
 
     def _on_solo_position_jump(self, view_name, frame):
         cell = self.cells.get(view_name)
@@ -957,6 +1145,7 @@ class MainWindow(QMainWindow):
         self.metadata_bar.set_metadata(self.metadata)
 
         self._backend_queue = list(self.cells.keys())
+        self._backend_init_complete = False
         QTimer.singleShot(200, self._init_next_backend)
 
         # library_ref handling
@@ -983,17 +1172,30 @@ class MainWindow(QMainWindow):
         synced_n = sum(1 for cell in self.cells.values() if cell.synced)
         total_n = len(self.cells)
         layout_str = f"{self.layout_config.rows}x{self.layout_config.cols}"
+        participants = self._synced_enabled_cells()
+        master = c.master_view(participants) or "--"
+        fps = c.master_fps(participants)
+        prefix = ""
+        request = self._seek_barrier.active
+        if request is not None:
+            prefix = (
+                f"Seeking frame {request.base_frame}… "
+                f"{len(request.frames)}/{len(request.targets)} views ready | ")
+        elif self._last_seek_error:
+            prefix = f"SEEK ERROR: {self._last_seek_error} | "
+        elif self._fps_warning:
+            prefix = self._fps_warning + " | "
         self.status_bar.showMessage(
-            f"帧率: {DEFAULT_FPS:.0f} | 基准帧: {c.base_frame} | "
+            prefix +
+            f"Backend: {cfg.BACKEND} Strict | Master: {master} {fps:.3f} FPS | "
+            f"基准帧: {c.base_frame} | "
             f"速度: {speed:.2f}x | 布局: {layout_str} | "
             f"选中: {sel} | 同步: {synced_n}/{total_n} | "
             f"标记: {nm} | 已保存: {mark}")
 
     def _update_title(self):
         c = self.controller
-        total = 0
-        for info in c.video_info.values():
-            total = max(total, info.get("total_frames", 0))
+        total = c._max_base_frame()
         speed = SPEED_STEPS[c.speed_index]
         session = Path(c.session_path).name if c.session_path else "未命名"
         meta_summary = ""
@@ -1012,6 +1214,9 @@ class MainWindow(QMainWindow):
         self.play_timer.stop()
         self._ui_timer.stop()
         self.sync_timer.stop()
+        self._seek_timeout_timer.stop()
+        if self._seek_barrier.active:
+            self._seek_barrier.cancel(self._seek_barrier.active.generation)
         for vn, cell in self.cells.items():
             cell.cleanup()
             self.grid_layout.removeWidget(cell)
@@ -1185,6 +1390,7 @@ class MainWindow(QMainWindow):
 
         # 按顺序初始化后端
         self._backend_queue = list(self.cells.keys())
+        self._backend_init_complete = False
         QTimer.singleShot(200, self._init_next_backend)
 
         self.statusBar().showMessage(
@@ -1291,6 +1497,7 @@ class MainWindow(QMainWindow):
 
         if loaded:
             self._backend_queue = loaded
+            self._backend_init_complete = False
             QTimer.singleShot(200, self._init_next_backend)
         self._update_status()
         self._update_title()

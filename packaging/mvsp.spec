@@ -5,11 +5,13 @@
 # 运行指令: 从仓库根目录 python -m PyInstaller --clean --noconfirm packaging/mvsp.spec
 # 生成时间: 2026-04-27 16:25
 
+import os
 from pathlib import Path
 
 # SPECPATH 由 PyInstaller 注入,值为 spec 文件所在目录(即 packaging/)
 ROOT = Path(SPECPATH).parent
 PKG  = ROOT / "packaging"
+DIST_NAME = os.environ.get("MVSP_DIST_NAME", "MultiViewSyncPlayer")
 
 block_cipher = None
 
@@ -35,6 +37,15 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+# Qt 6 links against the Windows system ICU (unversioned exports).  A foreign
+# icuuc.dll found on PATH (for example, Poppler/OpenCV's ICU 78 build) shadows
+# System32 in a frozen app and makes PySide6.QtWidgets fail with WinError 127.
+a.binaries = [
+    entry
+    for entry in a.binaries
+    if Path(entry[0]).name.lower() not in {"icuuc.dll", "icudt78.dll"}
+]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
@@ -62,5 +73,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="MultiViewSyncPlayer",
+    name=DIST_NAME,
 )

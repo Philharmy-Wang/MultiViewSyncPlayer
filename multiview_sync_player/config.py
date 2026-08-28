@@ -64,6 +64,9 @@ FFMPEG_PATH = _find_ffmpeg()
 # ---- OpenCV backend params ----
 DECODE_TARGET_WIDTH = 720
 DECODE_BUFFER_SIZE = 60   # ring buffer prefetch size
+RECENT_FRAME_CACHE_SIZE = 64
+SEQUENTIAL_STEP_WINDOW = 16
+SEEK_TIMEOUT_MS = 2000
 
 # ---- Color scheme (DaVinci Resolve style) ----
 COLOR_WINDOW_BG = "#1e1e1e"

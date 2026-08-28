@@ -214,10 +214,49 @@ class SyncController(QObject):
 
     def get_target_frame(self, view: str) -> int:
         """Get the absolute frame number for a given view."""
+        return self.get_target_frame_at(view, self.base_frame)
+
+    def get_target_frame_at(self, view: str, base_frame: int) -> int:
+        """Map any master frame to a clamped per-view frame."""
         offset = self.offsets.get(view, 0)
         total = self.video_info.get(view, {}).get("total_frames", 0)
-        target = self.base_frame + offset
+        target = base_frame + offset
         return max(0, min(target, total - 1)) if total > 0 else 0
+
+    def master_view(self, eligible_views=None):
+        """Return the explicit reference view used for the master clock."""
+        eligible = set(eligible_views) if eligible_views is not None else None
+        for view in self.video_info:
+            if view not in self.enabled_views:
+                continue
+            if eligible is None or view in eligible:
+                return view
+        return None
+
+    def master_fps(self, eligible_views=None) -> float:
+        view = self.master_view(eligible_views)
+        if view is None:
+            return DEFAULT_FPS
+        fps = float(self.video_info.get(view, {}).get("fps", DEFAULT_FPS))
+        return fps if fps > 0 else DEFAULT_FPS
+
+    def fps_mismatches(self, eligible_views=None, tolerance=0.01):
+        """Return enabled views whose FPS differs from the reference view."""
+        eligible = set(eligible_views) if eligible_views is not None else None
+        master = self.master_view(eligible)
+        if master is None:
+            return {}
+        reference = self.master_fps(eligible)
+        mismatches = {}
+        for view, info in self.video_info.items():
+            if view not in self.enabled_views:
+                continue
+            if eligible is not None and view not in eligible:
+                continue
+            fps = float(info.get("fps", DEFAULT_FPS))
+            if abs(fps - reference) > tolerance:
+                mismatches[view] = fps
+        return mismatches
 
     def frame_to_time_str(self, frame: int, fps: float = None) -> str:
         if fps is None:

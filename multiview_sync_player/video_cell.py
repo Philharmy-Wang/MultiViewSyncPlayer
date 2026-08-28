@@ -28,9 +28,10 @@ from PySide6.QtGui import (
 from .config import (
     COLOR_BORDER, COLOR_TEXT, COLOR_TEXT_DIM, COLOR_ACCENT,
     COLOR_POSITIVE, COLOR_NEGATIVE, COLOR_PANEL_BG,
-    DEFAULT_FPS, BACKEND, DECODE_TARGET_WIDTH, FFMPEG_PATH,
+    DEFAULT_FPS, DECODE_TARGET_WIDTH, FFMPEG_PATH,
     get_view_color,
 )
+from . import config as cfg
 from .styles import CELL_BTN_STYLE, PROGRESS_SLIDER_STYLE
 from .waveform_bar import WaveformBar
 from .video_decoder import PrefetchDecoder
@@ -263,6 +264,8 @@ class VideoCell(QWidget):
     sync_toggled = Signal(str, bool)
     solo_position_jump = Signal(str, int)
     video_file_selected = Signal(str, str)
+    seek_frame_ready = Signal(str, int, int, object)
+    seek_frame_failed = Signal(str, int, int, str)
 
     def __init__(self, view_name: str, temp_dir: str, parent=None):
         super().__init__(parent)
@@ -284,6 +287,8 @@ class VideoCell(QWidget):
         self.decoder = None   # PrefetchDecoder
         self.player = None    # mpv.MPV
         self._display_counter = 0  # throttle non-critical UI updates
+        self._latest_seek_request_id = 0
+        self._local_seek_generation = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -417,7 +422,7 @@ class VideoCell(QWidget):
         self.slider.setRange(0, max(1, total_frames - 1))
         self.current_frame = 0
 
-        if BACKEND == "mpv":
+        if cfg.BACKEND == "mpv":
             self._init_mpv(video_path)
         else:
             self._init_opencv(video_path)
@@ -427,8 +432,9 @@ class VideoCell(QWidget):
     def _init_opencv(self, video_path: str):
         self.decoder = PrefetchDecoder(video_path, DECODE_TARGET_WIDTH)
         self.decoder.frame_ready.connect(self._on_seek_frame_ready)
+        self.decoder.frame_failed.connect(self._on_seek_frame_failed)
         self.decoder.start()
-        self.decoder.seek(0)
+        self.decoder.seek(0, request_id=0)
 
     def _init_mpv(self, video_path: str):
         try:
@@ -465,9 +471,22 @@ class VideoCell(QWidget):
 
     # ---- Seek first frame push callback ----
 
-    def _on_seek_frame_ready(self, frame_number, qimg):
-        """First frame push after seek: display immediately."""
-        self.display_image(qimg, frame_number)
+    def _on_seek_frame_ready(self, request_id, frame_number, qimg):
+        """Drop stale callbacks; global requests are committed by the barrier."""
+        if request_id != self._latest_seek_request_id:
+            return
+        if request_id > 0:
+            self.seek_frame_ready.emit(
+                self.view_name, request_id, frame_number, qimg)
+        else:
+            self.display_image(qimg, frame_number)
+
+    def _on_seek_frame_failed(self, request_id, frame_number, message):
+        if request_id != self._latest_seek_request_id:
+            return
+        if request_id > 0:
+            self.seek_frame_failed.emit(
+                self.view_name, request_id, frame_number, message)
 
     # ---- Display frame (main thread) ----
 
@@ -501,38 +520,45 @@ class VideoCell(QWidget):
 
     # ---- Public interface ----
 
-    def seek_to_frame(self, frame: int):
+    def seek_to_frame(self, frame: int, request_id: int = None):
         """Seek to specified frame (called during pause/step)."""
         frame = max(0, min(frame, self.total_frames - 1)) if self.total_frames > 0 else 0
-        self.current_frame = frame
-        self.overlay.current_frame = frame
-        self.overlay.update()
-        if BACKEND == "mpv" and self.player and self.fps > 0:
+        if request_id is None:
+            self._local_seek_generation += 1
+            request_id = -self._local_seek_generation
+        self._latest_seek_request_id = request_id
+        if cfg.BACKEND == "mpv" and self.player and self.fps > 0:
             self.player.pause = True
             self.player.time_pos = frame / self.fps
+            self.current_frame = frame
+            self.overlay.current_frame = frame
+            self.overlay.update()
+            self.slider.blockSignals(True)
+            self.slider.setValue(frame)
+            self.slider.blockSignals(False)
+            self._update_time_label(frame)
+            if request_id > 0:
+                self.seek_frame_ready.emit(
+                    self.view_name, request_id, frame, None)
         elif self.decoder:
-            self.decoder.seek(frame)
-        self.slider.blockSignals(True)
-        self.slider.setValue(frame)
-        self.slider.blockSignals(False)
-        self._update_time_label(frame)
+            self.decoder.request_frame(frame, request_id)
 
     def play(self):
         """Start continuous decoding."""
         if self.decoder:
             self.decoder.set_playing(True)
-        if BACKEND == "mpv" and self.player and self.is_enabled:
+        if cfg.BACKEND == "mpv" and self.player and self.is_enabled:
             self.player.pause = False
 
     def pause(self):
         """Pause decoding."""
         if self.decoder:
             self.decoder.set_playing(False)
-        if BACKEND == "mpv" and self.player:
+        if cfg.BACKEND == "mpv" and self.player:
             self.player.pause = True
 
     def set_speed(self, speed: float):
-        if BACKEND == "mpv" and self.player:
+        if cfg.BACKEND == "mpv" and self.player:
             self.player.speed = speed
 
     def set_selected(self, selected: bool):
@@ -631,7 +657,7 @@ class VideoCell(QWidget):
         self.overlay.update()
         self.enable_toggled.emit(self.view_name, self.is_enabled)
         if not self.is_enabled:
-            if BACKEND == "mpv" and self.player:
+            if cfg.BACKEND == "mpv" and self.player:
                 self.player.pause = True
 
     def _on_slider_moved(self, value):

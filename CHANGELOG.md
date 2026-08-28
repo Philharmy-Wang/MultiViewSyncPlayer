@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2-test] - 2026-08-28
+
+### Fixed
+
+- Paused global step/seek now waits for every enabled synchronized view and
+  commits exact pixels, overlays, and sliders in one UI event cycle.
+- Stale asynchronous seek results can no longer overwrite the latest request.
+- Strict playback advances the master frame only when every synchronized view
+  has the exact target frame; individual-view frame drops are eliminated.
+- Playback now stops at the valid session end instead of allowing the logical
+  base frame to run past all video frames.
+- The master timer uses the reference video's actual FPS and reports mismatches.
+
+### Added
+
+- 64-frame recent cache, adjacent sequential stepping, seek retry/timeout state,
+  and an optional playback metrics HUD.
+- Deterministic pause-step, rapid-seek, strict-playback, FPS, and decoder tests.
+- Reproducible 2/4/6-view performance benchmark tooling.
+
 ## [0.2.0] - 2026-04-24
 
 ### Added

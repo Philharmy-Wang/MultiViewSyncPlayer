@@ -59,3 +59,5 @@ Desktop.ini
 
 # Project-specific
 *.mvsp.json.bak
+tests/_generated/
+benchmark_results/
