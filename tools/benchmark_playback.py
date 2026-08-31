@@ -19,7 +19,9 @@ BENCH_SOURCE_ROOT = Path(os.environ.get(
     "MVSP_BENCH_SOURCE_ROOT", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(BENCH_SOURCE_ROOT))
 
-from multiview_sync_player.video_decoder import PrefetchDecoder
+from multiview_sync_player.video_decoder import (
+    PrefetchDecoder, probe_keyframe_index, probe_video_metadata,
+)
 
 
 def wait_until(app, predicate, timeout):
@@ -33,8 +35,15 @@ def wait_until(app, predicate, timeout):
     return bool(predicate())
 
 
-def benchmark(view_count, sources, duration, media_label):
+def benchmark(view_count, sources, duration, media_label, timeout=10.0,
+              preindex=False):
     app = QCoreApplication.instance() or QCoreApplication([])
+    index_started = time.perf_counter()
+    if preindex:
+        for source in dict.fromkeys(sources):
+            metadata = probe_video_metadata(source)
+            probe_keyframe_index(source, metadata["fps"])
+    index_ms = (time.perf_counter() - index_started) * 1000.0
     decoders = [
         PrefetchDecoder(sources[index % len(sources)], target_width=720,
                         buffer_size=60)
@@ -65,36 +74,36 @@ def benchmark(view_count, sources, duration, media_label):
         decoder.start()
     request_all(0)
     first_ok = wait_until(
-        app, lambda: all(frame == 0 for frame in delivered), 10.0)
+        app, lambda: all(frame == 0 for frame in delivered), timeout)
     startup_ms = (time.perf_counter() - started) * 1000.0
     if not first_ok:
         raise RuntimeError("first-frame timeout")
 
     request_all(100)
-    if not wait_until(app, lambda: all(frame == 100 for frame in delivered), 10.0):
+    if not wait_until(app, lambda: all(frame == 100 for frame in delivered), timeout):
         raise RuntimeError("warm-up seek timeout")
 
     started = time.perf_counter()
     request_all(101)
-    if not wait_until(app, lambda: all(frame == 101 for frame in delivered), 10.0):
+    if not wait_until(app, lambda: all(frame == 101 for frame in delivered), timeout):
         raise RuntimeError("single-step timeout")
     step_ms = (time.perf_counter() - started) * 1000.0
 
     started = time.perf_counter()
     for frame in range(102, 112):
         request_all(frame)
-    if not wait_until(app, lambda: all(frame == 111 for frame in delivered), 10.0):
+    if not wait_until(app, lambda: all(frame == 111 for frame in delivered), timeout):
         raise RuntimeError("rapid-step timeout")
     rapid_ms = (time.perf_counter() - started) * 1000.0
 
     started = time.perf_counter()
     request_all(300)
-    if not wait_until(app, lambda: all(frame == 300 for frame in delivered), 10.0):
+    if not wait_until(app, lambda: all(frame == 300 for frame in delivered), timeout):
         raise RuntimeError("random-seek timeout")
     random_seek_ms = (time.perf_counter() - started) * 1000.0
 
     request_all(0)
-    if not wait_until(app, lambda: all(frame == 0 for frame in delivered), 10.0):
+    if not wait_until(app, lambda: all(frame == 0 for frame in delivered), timeout):
         raise RuntimeError("playback reset timeout")
     for decoder in decoders:
         decoder.set_playing(True)
@@ -159,6 +168,7 @@ def benchmark(view_count, sources, duration, media_label):
         "views": view_count,
         "policy": "strict" if strict_api else "v0.2.1-independent",
         "resolution": media_label,
+        "keyframe_preindex_ms": round(index_ms, 2) if preindex else None,
         "startup_latency_ms": round(startup_ms, 2),
         "first_frame_latency_ms": round(startup_ms, 2),
         "single_step_latency_ms": round(step_ms, 2),
@@ -181,13 +191,18 @@ def main():
     parser.add_argument("--source", action="append", required=True)
     parser.add_argument("--views", type=int, action="append", default=[])
     parser.add_argument("--duration", type=float, default=10.0)
+    parser.add_argument("--timeout", type=float, default=10.0,
+                        help="per-operation timeout in seconds")
+    parser.add_argument("--preindex", action="store_true",
+                        help="build keyframe indexes sequentially before timing")
     parser.add_argument(
         "--media-label",
         default="1920x1080 H.264 source / 720px decode")
     parser.add_argument("--output")
     args = parser.parse_args()
     view_counts = args.views or [2, 4, 6]
-    results = [benchmark(count, args.source, args.duration, args.media_label)
+    results = [benchmark(count, args.source, args.duration, args.media_label,
+                         timeout=args.timeout, preindex=args.preindex)
                for count in view_counts]
     payload = {
         "python": sys.version,

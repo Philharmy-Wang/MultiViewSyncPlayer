@@ -177,8 +177,12 @@ class OverlayWidget(QWidget):
         painter.fillRect(4, h - th - 8, tw, th, bg)
         painter.drawText(9, h - th - 8 + th - 5, ts)
 
-        # Bottom-right: offset
-        if self.offset > 0:
+        # Bottom-right: offset for linked views; local mode is explicit so a
+        # stale pre-unlink offset cannot be mistaken for the visible frame.
+        if not self.synced:
+            os_ = "LOCAL"
+            oc = QColor(255, 152, 0)
+        elif self.offset > 0:
             os_ = f"offset: +{self.offset}"
             oc = QColor(COLOR_POSITIVE)
         elif self.offset < 0:
@@ -284,6 +288,7 @@ class VideoCell(QWidget):
         self.temp_dir = temp_dir
         self.offset = 0
         self.current_frame = 0
+        self.local_frame = 0
         self.total_frames = 0
         self.fps = DEFAULT_FPS
         self.is_enabled = True
@@ -360,35 +365,35 @@ class VideoCell(QWidget):
                               self._toggle_enable, fixed_width=26)
         cl.addSpacing(2)
 
-        btn("◀◀", "偏移 -25 帧",
-            lambda: self.offset_changed.emit(self.view_name, -25))
-        btn("◀", "偏移 -1 帧",
-            lambda: self.offset_changed.emit(self.view_name, -1))
+        btn("◀◀", "本视角 -25 帧",
+            lambda: self._request_local_step(-25))
+        btn("◀", "本视角 -1 帧",
+            lambda: self._request_local_step(-1))
         self.btn_solo = btn("▶/⏸", "独立播放此视角", self._toggle_solo)
         self._solo_timer = QTimer(self)
         self._solo_timer.timeout.connect(self._on_solo_tick)
         self._solo_playing = False
-        btn("▶", "偏移 +1 帧",
-            lambda: self.offset_changed.emit(self.view_name, 1))
-        btn("▶▶", "偏移 +25 帧",
-            lambda: self.offset_changed.emit(self.view_name, 25))
+        btn("▶", "本视角 +1 帧",
+            lambda: self._request_local_step(1))
+        btn("▶▶", "本视角 +25 帧",
+            lambda: self._request_local_step(25))
         cl.addSpacing(4)
-        btn("-", "偏移 -1 帧",
-            lambda: self.offset_changed.emit(self.view_name, -1), fixed_width=20)
+        btn("-", "本视角 -1 帧",
+            lambda: self._request_local_step(-1), fixed_width=20)
         self.lbl_offset = QLabel("0")
         self.lbl_offset.setAlignment(Qt.AlignCenter)
         self.lbl_offset.setFixedWidth(36)
         self.lbl_offset.setStyleSheet(
             f"color: {COLOR_TEXT}; font-size: 9pt; font-family: Consolas;")
         cl.addWidget(self.lbl_offset)
-        btn("+", "偏移 +1 帧",
-            lambda: self.offset_changed.emit(self.view_name, 1), fixed_width=20)
+        btn("+", "本视角 +1 帧",
+            lambda: self._request_local_step(1), fixed_width=20)
         cl.addStretch()
         layout.addWidget(ctrl)
 
         # ---- Waveform bar ----
         self.waveform = WaveformBar(view_name)
-        self.waveform.position_clicked.connect(self.position_jump.emit)
+        self.waveform.position_clicked.connect(self._on_slider_moved)
         layout.addWidget(self.waveform)
 
     # ---- Sync lock ----
@@ -399,6 +404,10 @@ class VideoCell(QWidget):
         self.overlay.update()
         self._update_sync_style()
         self.sync_toggled.emit(self.view_name, self.synced)
+
+    def _request_local_step(self, delta: int):
+        """Route a per-view step without conflating it with master sync."""
+        self.solo_stepping.emit(self.view_name, delta)
 
     def _update_sync_style(self):
         if self.synced:
@@ -413,6 +422,8 @@ class VideoCell(QWidget):
             self.btn_sync.setStyleSheet(
                 CELL_BTN_STYLE +
                 "QPushButton { background: #5a3a2a; border-color: #FF9800; }")
+        if hasattr(self, "lbl_offset"):
+            self.update_offset_label(self.offset)
 
     # ---- Double-click select video ----
 
@@ -433,6 +444,7 @@ class VideoCell(QWidget):
         self.overlay.fps = fps
         self.slider.setRange(0, max(1, total_frames - 1))
         self.current_frame = 0
+        self.local_frame = 0
 
         if cfg.BACKEND == "mpv":
             self._init_mpv(video_path)
@@ -512,6 +524,7 @@ class VideoCell(QWidget):
         self._pixmap = pixmap
         self._last_good_pixmap = pixmap
         self.current_frame = frame_idx
+        self.local_frame = frame_idx
 
         if fast:
             self._display_counter += 1
@@ -538,6 +551,7 @@ class VideoCell(QWidget):
     def seek_to_frame(self, frame: int, request_id: int = None):
         """Seek to specified frame (called during pause/step)."""
         frame = max(0, min(frame, self.total_frames - 1)) if self.total_frames > 0 else 0
+        self.local_frame = frame
         if request_id is None:
             self._local_seek_generation += 1
             request_id = -self._local_seek_generation
@@ -591,7 +605,10 @@ class VideoCell(QWidget):
         self.waveform.set_offset(offset)
 
     def update_offset_label(self, offset: int):
-        if offset > 0:
+        if not self.synced:
+            self.lbl_offset.setText("LOCAL")
+            c = "#FF9800"
+        elif offset > 0:
             self.lbl_offset.setText(f"+{offset}")
             c = COLOR_POSITIVE
         elif offset < 0:

@@ -467,11 +467,11 @@ class MainWindow(QMainWindow):
             if key == Qt.Key_Left:
                 d = (-25 if mods & Qt.ShiftModifier
                      else -250 if mods & Qt.ControlModifier else -1)
-                ctrl.adjust_offset(ctrl.selected_view, d); return
+                self._step_local_view(ctrl.selected_view, d); return
             if key == Qt.Key_Right:
                 d = (25 if mods & Qt.ShiftModifier
                      else 250 if mods & Qt.ControlModifier else 1)
-                ctrl.adjust_offset(ctrl.selected_view, d); return
+                self._step_local_view(ctrl.selected_view, d); return
         super().keyPressEvent(event)
 
     # ---- 会话回调 ----
@@ -643,9 +643,26 @@ class MainWindow(QMainWindow):
         self._update_title()
 
     def _on_offset_changed(self, view, offset):
-        if view in self.cells:
-            self.cells[view].set_offset(offset)
+        cell = self.cells.get(view)
+        if cell is None or not cell.synced:
+            return
+        cell.set_offset(offset)
         self._on_base_frame_changed(self.controller.base_frame)
+
+    def _step_local_view(self, view_name, delta):
+        """Step one enabled view according to its linked/local state."""
+        cell = self.cells.get(view_name)
+        if cell is None or not cell.is_enabled:
+            return
+        if cell.synced:
+            self.controller.adjust_offset(view_name, delta)
+            return
+        last = max(0, cell.total_frames - 1)
+        target = max(0, min(cell.local_frame + delta, last))
+        cell.local_frame = target
+        cell.seek_to_frame(target)
+        cell.waveform.set_base_frame(target)
+        self._update_status()
 
     def _synced_enabled_cells(self):
         return {
@@ -821,15 +838,13 @@ class MainWindow(QMainWindow):
             lambda vn=view_name: self._on_view_clicked(vn))
         cell.offset_changed.connect(self.controller.adjust_offset)
         cell.position_jump.connect(self.controller.seek_to)
-        cell.solo_stepping.connect(
-            lambda vn, d: self.controller.adjust_offset(vn, d))
+        cell.solo_stepping.connect(self._step_local_view)
         cell.enable_toggled.connect(self._on_view_enabled)
         cell.sync_toggled.connect(self._on_sync_toggled)
         cell.solo_position_jump.connect(self._on_solo_position_jump)
         cell.video_file_selected.connect(self._on_manual_video_selected)
         cell.seek_frame_ready.connect(self._on_seek_frame_ready)
         cell.seek_frame_failed.connect(self._on_seek_frame_failed)
-        cell.waveform.position_clicked.connect(self.controller.seek_to)
         cell.grid_pos = (row, col)
         linear_idx = row * self.layout_config.cols + col
         cell.set_view_color(VIEW_COLORS[linear_idx % len(VIEW_COLORS)])
@@ -928,6 +943,22 @@ class MainWindow(QMainWindow):
     # ---- 同步锁回调 ----
 
     def _on_sync_toggled(self, view_name, synced):
+        cell = self.cells.get(view_name)
+        if cell is None:
+            return
+        # Anchor both transitions to the currently committed image. Unlink
+        # captures it as local state; relink derives the fresh offset from it.
+        visible_frame = max(0, min(
+            cell.current_frame, max(0, cell.total_frames - 1)))
+        cell.local_frame = visible_frame
+        if synced:
+            new_offset = visible_frame - self.controller.base_frame
+            self.controller.offsets[view_name] = new_offset
+            self.controller.saved = False
+            cell.set_offset(new_offset)
+        else:
+            cell.pause()
+            cell.update_offset_label(cell.offset)
         self._refresh_fps_warning()
         self._on_base_frame_changed(self.controller.base_frame)
 
@@ -938,8 +969,12 @@ class MainWindow(QMainWindow):
 
     def _on_solo_position_jump(self, view_name, frame):
         cell = self.cells.get(view_name)
-        if cell:
-            cell.seek_to_frame(frame)
+        if cell and cell.is_enabled:
+            last = max(0, cell.total_frames - 1)
+            target = max(0, min(frame, last))
+            cell.local_frame = target
+            cell.seek_to_frame(target)
+            cell.waveform.set_base_frame(target)
 
     # ---- 视角选择 ----
 
