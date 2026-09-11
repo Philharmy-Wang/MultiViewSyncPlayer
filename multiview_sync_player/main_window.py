@@ -8,6 +8,7 @@ multiview_sync_player.main_window — 主窗口
 """
 
 import json
+import collections
 import os
 import shutil
 import tempfile
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox,
     QStatusBar, QFileDialog, QDialog, QMenu, QMenuBar, QLabel, QFrame,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QPoint, QSettings
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPoint, QSettings
 from PySide6.QtGui import QShortcut, QKeySequence, QAction
 
 from .config import (
@@ -28,6 +29,7 @@ from .config import (
     VIEW_COLORS,
 )
 from . import config as cfg
+from .backend import choose_backend
 from .styles import DARK_THEME_QSS
 from .video_decoder import probe_video_metadata
 from .sync_controller import SyncController
@@ -45,6 +47,54 @@ from .library.browser import LibraryBrowserDock
 from .library.import_wizard import ImportWizard
 from .library.executor import ImportExecutor
 from .library.schema import SubjectEntry, ViewEntry
+
+
+class SessionLoadThread(QThread):
+    """Resolve identities and probe media away from Qt's GUI thread."""
+
+    progress = Signal(int, int, str)
+    completed = Signal(int, object, object, str)
+
+    def __init__(self, generation: int, data: SessionData, path: str, parent=None):
+        super().__init__(parent)
+        self.generation = generation
+        self.data = data
+        self.path = path
+
+    def run(self):
+        try:
+            if not self.data.video_manifests:
+                self.data.video_manifests = discover_legacy_video_manifests(
+                    Path(self.path), self.data)
+                MainWindow._add_cells_for_manifests(self.data)
+            initial = resolve_session_videos(self.data, Path(self.path))
+            actual = {}
+            items = list(initial.items())
+            total = len(items)
+            for index, (view_name, item) in enumerate(items, 1):
+                if self.isInterruptionRequested():
+                    self.completed.emit(
+                        self.generation, self.data, {}, "cancelled")
+                    return
+                self.progress.emit(index - 1, total, view_name)
+                if item.path is not None:
+                    actual[view_name] = probe_video_metadata(str(item.path))
+                    self.data.video_manifests.setdefault(view_name, {}).update(
+                        actual[view_name])
+                    for cell in self.data.cells:
+                        if cell.get("view_name") == view_name:
+                            cell.update(actual[view_name])
+                            cell["_metadata_probed"] = True
+                            break
+            resolutions = resolve_session_videos(
+                self.data, Path(self.path), actual_metadata=actual)
+            self.progress.emit(total, total, "")
+            self.completed.emit(
+                self.generation, self.data, resolutions, "")
+        except Exception as exc:
+            self.completed.emit(
+                self.generation, self.data, {},
+                f"{type(exc).__name__}: {exc}")
 
 
 # ==================== 元数据栏 ====================
@@ -186,18 +236,23 @@ class _EmptySlot(QWidget):
 class MainWindow(QMainWindow):
     """多视角视频同步播放主窗口。"""
 
-    def __init__(self, session_path=None, backend='opencv', layout_config=None):
+    def __init__(self, session_path=None, backend='auto', layout_config=None):
         super().__init__()
         self.setWindowTitle("多视角同步播放器")
         self.setMinimumSize(1200, 800)
         self.resize(1600, 900)
 
-        cfg.BACKEND = backend
+        self.backend_decision = choose_backend(backend)
+        cfg.BACKEND = self.backend_decision.active
+        cfg.BACKEND_MODE = self.backend_decision.mode
+        cfg.BACKEND_REQUESTED = self.backend_decision.requested
+        cfg.BACKEND_REASON = self.backend_decision.reason
 
         self.controller = SyncController()
         self._seek_barrier = SeekBarrier()
         self._last_seek_latency_ms = 0.0
         self._last_seek_error = ""
+        self._signal_slot_samples_ms = collections.deque(maxlen=2048)
         self._playback_stall_ticks = 0
         self._displayed_ticks = 0
         self._play_started_at = None
@@ -205,6 +260,9 @@ class MainWindow(QMainWindow):
         self._backend_init_complete = True
         self._initial_session_loading = False
         self._pending_review_state = None
+        self._session_load_generation = 0
+        self._session_load_workers = []
+        self._audio_loading_active = False
         self.metadata = SessionMetadata()
         self.cells = {}
         self._slot_widgets = {}
@@ -520,61 +578,83 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "加载失败", f"无法加载会话文件:\n{e}")
             return
 
-        try:
-            # A legacy alignment can contain offsets/layout only. Its video
-            # discovery is deliberately strict and stays inside this subject
-            # directory; it never scans the whole drive.
-            if not data.video_manifests:
-                data.video_manifests = discover_legacy_video_manifests(path, data)
-                self._add_cells_for_manifests(data)
+        self._session_load_generation += 1
+        generation = self._session_load_generation
+        for existing in self._session_load_workers:
+            if existing.isRunning():
+                existing.requestInterruption()
+        self._clear_all()
+        self.controller.session_path = path
+        if data.layout:
+            self.layout_config = LayoutConfig.from_dict(data.layout)
+            self._rebuild_view_maps()
+            self._populate_grid()
+        self._initial_session_loading = True
+        total = len(data.video_manifests or data.cells)
+        self.status_bar.showMessage(f"Loading session metadata… 0/{total}")
+        worker = SessionLoadThread(generation, data, path, self)
+        self._session_load_workers.append(worker)
+        worker.progress.connect(self._on_session_load_progress)
+        worker.completed.connect(self._on_session_load_complete)
+        worker.finished.connect(
+            lambda w=worker: self._session_load_workers.remove(w)
+            if w in self._session_load_workers else None)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
-            resolutions = self._resolve_session_data(data, path)
-            missing = [item for item in resolutions.values() if item.path is None]
-            if missing:
-                resolutions = self._offer_session_relocation(data, path, resolutions)
-                if resolutions is None:
-                    return
+    def _on_session_load_progress(self, completed, total, view_name):
+        self.status_bar.showMessage(
+            f"Loading session metadata… {completed}/{total} {view_name}")
 
-            # Re-check mismatches after a relocation/file selection. A path
-            # being found is not enough to accept a different video silently.
-            mismatches = [item for item in resolutions.values()
-                          if item.path is not None and item.identity_ok is False]
-            if mismatches:
-                summary = "\n".join(
-                    f"{item.view_name}: {item.identity_message}\n"
-                    f"相对路径: {item.relative_path or '(无)'}\n"
-                    f"绝对路径: {item.absolute_path or '(无)'}"
-                    for item in mismatches)
-                answer = QMessageBox.warning(
-                    self, "视频身份校验不一致",
-                    "以下文件与会话记录不一致，可能被替换。\n\n" + summary
-                    + "\n\n是否明确确认仍然打开这些文件？",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-                if answer != QMessageBox.Yes:
-                    return
-                for item in mismatches:
-                    item.identity_ok = True
-
-            missing = [item for item in resolutions.values() if not item.ok]
-            if missing:
-                summary = "\n".join(
-                    f"{item.view_name}: expected {item.relative_path or '(no relative path)'}"
-                    f"\n  old absolute: {item.absolute_path or '(none)'}"
-                    for item in missing)
-                answer = QMessageBox.warning(
-                    self, "会话视频不完整",
-                    f"{len(missing)}/{len(resolutions)} 个视频无法安全解析:\n\n"
-                    + summary
-                    + "\n\n选择“是”将只打开已解析视角；选择“否”取消。",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-                if answer != QMessageBox.Yes:
-                    return
-
-            self._apply_resolutions(data, resolutions)
-        except SessionResolutionError as e:
-            QMessageBox.warning(self, "旧版会话无法自动迁移", str(e))
+    def _on_session_load_complete(self, generation, data, resolutions, error):
+        if generation != self._session_load_generation or error == "cancelled":
             return
-
+        if error:
+            self._initial_session_loading = False
+            QMessageBox.warning(self, "加载失败", f"无法初始化会话视频:\n{error}")
+            return
+        missing = [item for item in resolutions.values() if item.path is None]
+        if missing:
+            resolutions = self._offer_session_relocation(
+                data, self.controller.session_path, resolutions)
+            if resolutions is None:
+                self._initial_session_loading = False
+                return
+        mismatches = [item for item in resolutions.values()
+                      if item.path is not None and item.identity_ok is False]
+        if mismatches:
+            summary = "\n".join(
+                f"{item.view_name}: {item.identity_message}\n"
+                f"相对路径: {item.relative_path or '(无)'}\n"
+                f"绝对路径: {item.absolute_path or '(无)'}"
+                for item in mismatches)
+            answer = QMessageBox.warning(
+                self, "视频身份校验不一致",
+                "以下文件与会话记录不一致，可能被替换。\n\n" + summary
+                + "\n\n是否明确确认仍然打开这些文件？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                self._initial_session_loading = False
+                return
+            for item in mismatches:
+                item.identity_ok = True
+        unavailable = [item for item in resolutions.values() if not item.ok]
+        if unavailable:
+            summary = "\n".join(
+                f"{item.view_name}: expected {item.relative_path or '(no relative path)'}"
+                f"\n  old absolute: {item.absolute_path or '(none)'}"
+                for item in unavailable)
+            answer = QMessageBox.warning(
+                self, "会话视频不完整",
+                f"{len(unavailable)}/{len(resolutions)} 个视频无法安全解析:\n\n"
+                + summary
+                + "\n\n选择“是”将只打开已解析视角；选择“否”取消。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                self._initial_session_loading = False
+                return
+        self._apply_resolutions(data, resolutions)
+        path = self.controller.session_path
         self._clear_all()
         self.controller.session_path = path
         self._apply_session_data(data)
@@ -834,9 +914,12 @@ class MainWindow(QMainWindow):
             cell.set_seek_pending(pending)
 
     def _on_seek_frame_ready(self, view, generation, frame_number, image):
+        callback_started = perf_counter()
         complete = self._seek_barrier.accept(
             generation, view, frame_number, image)
         if not complete:
+            self._signal_slot_samples_ms.append(
+                (perf_counter() - callback_started) * 1000.0)
             self._update_status()
             return
 
@@ -863,6 +946,8 @@ class MainWindow(QMainWindow):
         self._update_debug_metrics()
         self._update_status()
         self._update_title()
+        self._signal_slot_samples_ms.append(
+            (perf_counter() - callback_started) * 1000.0)
 
     def _on_seek_frame_failed(self, view, generation, frame_number, message):
         request = self._seek_barrier.active
@@ -988,6 +1073,7 @@ class MainWindow(QMainWindow):
         cell.video_file_selected.connect(self._on_manual_video_selected)
         cell.seek_frame_ready.connect(self._on_seek_frame_ready)
         cell.seek_frame_failed.connect(self._on_seek_frame_failed)
+        cell.audio_load_finished.connect(self._on_audio_load_finished)
         cell.grid_pos = (row, col)
         linear_idx = row * self.layout_config.cols + col
         cell.set_view_color(VIEW_COLORS[linear_idx % len(VIEW_COLORS)])
@@ -1049,14 +1135,20 @@ class MainWindow(QMainWindow):
             self._backend_init_complete = True
             pending = self._pending_review_state
             if pending is None:
-                self.controller.base_frame = 0
+                desired_base = 0
             else:
                 max_base = self.controller._max_base_frame()
-                self.controller.base_frame = max(
+                desired_base = max(
                     0, min(int(pending.get("base_frame", 0)), max_base))
+                # A fast decoder can make controls usable before the queued
+                # initializer reaches this final callback.  Never rewind a
+                # frame the user already selected during that short window.
+                user_moved_during_load = self.controller.base_frame != desired_base
+                if not user_moved_during_load:
+                    self.controller.base_frame = desired_base
                 for vn, state in pending.get("per_view", {}).items():
                     cell = self.cells.get(vn)
-                    if cell is None or cell.synced:
+                    if cell is None or cell.synced or user_moved_during_load:
                         continue
                     last = max(0, cell.total_frames - 1)
                     target = state.get("local_frame", state.get(
@@ -1086,21 +1178,27 @@ class MainWindow(QMainWindow):
 
     def _start_audio_loading(self):
         self._audio_queue = list(self.cells.keys())
-        self._audio_timer = QTimer(self)
-        self._audio_timer.timeout.connect(self._load_next_audio)
-        self._audio_timer.start(50)
+        self._audio_loading_active = True
+        self._load_next_audio()
 
     def _load_next_audio(self):
         if not hasattr(self, '_audio_queue') or not self._audio_queue:
-            if hasattr(self, '_audio_timer'):
-                self._audio_timer.stop()
+            self._audio_loading_active = False
+            self._update_status()
             return
         vn = self._audio_queue.pop(0)
         info = self.controller.video_info.get(vn, {})
         if vn in self.cells and info.get("path"):
+            self.status_bar.showMessage(
+                f"Loading audio waveform… {len(self.cells) - len(self._audio_queue)}/"
+                f"{len(self.cells)} {vn}")
             self.cells[vn].load_audio(info["path"])
-        if not self._audio_queue:
-            self._audio_timer.stop()
+        else:
+            QTimer.singleShot(0, self._load_next_audio)
+
+    def _on_audio_load_finished(self, view_name):
+        if self._audio_loading_active:
+            QTimer.singleShot(0, self._load_next_audio)
 
     # ---- 同步锁回调 ----
 
@@ -1346,6 +1444,10 @@ class MainWindow(QMainWindow):
             "base_frame": int(desired_base or 0),
             "per_view": review.get("per_view", {}),
         }
+        # Establish the saved logical position before asynchronous backend
+        # creation.  The final initialization callback may then distinguish a
+        # genuine user move from the intended restored position.
+        self.controller.base_frame = int(desired_base or 0)
         self._initial_session_loading = True
 
         for cell in data.cells:
@@ -1363,7 +1465,10 @@ class MainWindow(QMainWindow):
                         break
                 if pos is None:
                     continue
-            meta = probe_video_metadata(video_path)
+            if cell.get("_metadata_probed"):
+                meta = cell
+            else:
+                meta = probe_video_metadata(video_path)
             if meta["total_frames"] <= 0:
                 continue
             self.controller.video_info[vn] = {
@@ -1420,6 +1525,17 @@ class MainWindow(QMainWindow):
         participants = self._synced_enabled_cells()
         master = c.master_view(participants) or "--"
         fps = c.master_fps(participants)
+        runtime = None
+        runtime_view = c.selected_view or master
+        if runtime_view in self.cells:
+            runtime = self.cells[runtime_view].backend_status(
+                c.video_info.get(runtime_view, {}).get("codec", ""))
+        runtime_text = ""
+        if runtime:
+            runtime_text = (
+                f"Codec: {runtime['codec']} | HW: {runtime['hwdec_current']} | "
+                f"GPU decode: {'yes' if runtime['gpu_decode_active'] else 'no'} | "
+                f"Dropped: {runtime['dropped_frames']} | ")
         prefix = ""
         request = self._seek_barrier.active
         if request is not None:
@@ -1432,7 +1548,8 @@ class MainWindow(QMainWindow):
             prefix = self._fps_warning + " | "
         self.status_bar.showMessage(
             prefix +
-            f"Backend: {cfg.BACKEND} Strict | Master: {master} {fps:.3f} FPS | "
+            f"Backend: {cfg.BACKEND_REQUESTED}→{cfg.BACKEND} "
+            f"{cfg.BACKEND_MODE} | {runtime_text}Master: {master} {fps:.3f} FPS | "
             f"基准帧: {c.base_frame} | "
             f"速度: {speed:.2f}x | 布局: {layout_str} | "
             f"选中: {sel} | 同步: {synced_n}/{total_n} | "

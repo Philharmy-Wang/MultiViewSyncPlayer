@@ -10,7 +10,6 @@ Also contains video metadata probing utility.
 import bisect
 import collections
 import ctypes
-import subprocess
 import sys
 import threading
 from time import perf_counter
@@ -22,12 +21,25 @@ from PySide6.QtGui import QImage
 
 from .config import (
     DECODE_TARGET_WIDTH,
+    DECODE_THREADS_PER_VIEW,
+    OPENCV_INTERNAL_THREADS,
     DECODE_BUFFER_SIZE,
     RECENT_FRAME_CACHE_SIZE,
     SEQUENTIAL_STEP_WINDOW,
     FFPROBE_PATH,
     SEEK_KEYFRAME_DECODE_MARGIN,
 )
+from .media_cache import (
+    get_keyframes, get_metadata, get_packet_count, put_keyframes, put_metadata,
+    record_keyframe_scan,
+)
+from .process_utils import run_hidden
+
+
+# Resize/colour operations are already distributed across per-view decoder
+# threads.  A large global OpenCV pool inside each operation causes nested
+# oversubscription without changing decoded pixels.
+cv2.setNumThreads(OPENCV_INTERNAL_THREADS)
 
 
 # ==================== Windows CJK path helpers ====================
@@ -47,14 +59,24 @@ def _get_short_path(long_path: str) -> str:
         return long_path
 
 
-def _safe_video_capture(path):
+def _safe_video_capture(path, decoder_threads=None):
     """Open video with OpenCV, falling back to short path on Windows."""
-    cap = cv2.VideoCapture(str(path))
+    def open_path(candidate):
+        if decoder_threads and hasattr(cv2, "CAP_PROP_N_THREADS"):
+            cap = cv2.VideoCapture(
+                str(candidate), cv2.CAP_FFMPEG,
+                [cv2.CAP_PROP_N_THREADS, int(decoder_threads)])
+            if cap.isOpened():
+                return cap
+            cap.release()
+        return cv2.VideoCapture(str(candidate))
+
+    cap = open_path(path)
     if cap.isOpened():
         return cap
     short = _get_short_path(str(path))
     if short != str(path):
-        cap = cv2.VideoCapture(short)
+        cap = open_path(short)
         if cap.isOpened():
             return cap
     return None
@@ -62,9 +84,16 @@ def _safe_video_capture(path):
 
 # ==================== Video metadata probe ====================
 
-def probe_video_metadata(video_path: str) -> dict:
+def probe_video_metadata(video_path: str, use_cache: bool = True) -> dict:
     """Probe video metadata used by playback and session identity checks."""
     from pathlib import Path
+    if use_cache:
+        try:
+            cached = get_metadata(video_path)
+        except OSError:
+            cached = None
+        if cached is not None:
+            return _apply_cached_packet_count(video_path, cached)
     cap = _safe_video_capture(video_path)
     if cap is None or not cap.isOpened():
         return {"path": str(video_path), "fps": 25.0, "total_frames": 0,
@@ -87,7 +116,7 @@ def probe_video_metadata(video_path: str) -> dict:
     has_audio = Path(video_path).suffix.lower() in (
         ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv")
 
-    return {
+    result = {
         "path": str(video_path),
         "fps": fps,
         "total_frames": total,
@@ -97,12 +126,35 @@ def probe_video_metadata(video_path: str) -> dict:
         "duration_sec": duration,
         "codec": codec,
     }
+    if use_cache:
+        try:
+            put_metadata(video_path, result)
+        except OSError:
+            pass
+    return result
 
 
 # ==================== Ring-buffer prefetch decoder ====================
 
 # path -> sorted keyframe frame-number list (shared across decoder threads)
 _KEYFRAME_INDEX_CACHE = {}
+_KEYFRAME_SCAN_LOCKS = {}
+_KEYFRAME_SCAN_LOCKS_GUARD = threading.Lock()
+
+
+def _apply_cached_packet_count(video_path, metadata):
+    """Correct container frame-count estimates after a full packet scan."""
+    try:
+        packet_count = get_packet_count(video_path)
+    except OSError:
+        packet_count = None
+    if packet_count and metadata.get("total_frames") != packet_count:
+        metadata = dict(metadata)
+        metadata["total_frames"] = packet_count
+        fps = float(metadata.get("fps") or 0)
+        if fps > 0:
+            metadata["duration_sec"] = packet_count / fps
+    return metadata
 
 
 def probe_keyframe_index(video_path, fps: float) -> list:
@@ -115,21 +167,27 @@ def probe_keyframe_index(video_path, fps: float) -> list:
     """
     from pathlib import Path
     path = Path(video_path)
-    cached = _KEYFRAME_INDEX_CACHE.get(str(path))
+    cache_key = str(path.resolve())
+    cached = _KEYFRAME_INDEX_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    try:
+        cached = get_keyframes(path)
+    except OSError:
+        cached = None
+    if cached is not None:
+        _KEYFRAME_INDEX_CACHE[cache_key] = cached
+        return cached
     index = []
+    packet_count = 0
     if FFPROBE_PATH and fps > 0:
         try:
-            creationflags = 0
-            if sys.platform == "win32":
-                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            proc = subprocess.run(
+            record_keyframe_scan()
+            proc = run_hidden(
                 [FFPROBE_PATH, "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "packet=flags,pts_time",
                  "-of", "csv=p=0", str(path)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=120, creationflags=creationflags)
+                stdout=-1, stderr=-1, timeout=120)
             lines = proc.stdout.decode("ascii", errors="ignore").splitlines()
             start_pts = None
             for line in lines:
@@ -149,6 +207,7 @@ def probe_keyframe_index(video_path, fps: float) -> list:
                             pts = value
                 if pts is None:
                     continue
+                packet_count += 1
                 if start_pts is None:
                     start_pts = pts
                 if flags.startswith("K"):
@@ -159,7 +218,17 @@ def probe_keyframe_index(video_path, fps: float) -> list:
                         index.append(frame_number)
         except Exception:
             index = []
-    _KEYFRAME_INDEX_CACHE[str(path)] = index
+    _KEYFRAME_INDEX_CACHE[cache_key] = index
+    try:
+        put_keyframes(path, index, packet_count=packet_count or None)
+        if packet_count:
+            metadata = get_metadata(path)
+            if metadata is not None:
+                corrected = _apply_cached_packet_count(path, metadata)
+                if corrected != metadata:
+                    put_metadata(path, corrected)
+    except OSError:
+        pass
     return index
 
 
@@ -199,18 +268,38 @@ class PrefetchDecoder(QThread):
         self._cache_misses = 0
         self._random_seeks = 0
         self._decoded_frames = 0
+        self._keyframes = []
+        self._all_frames_keyframes = False
+        self._index_thread = None
+        self._conversion_samples_ms = collections.deque(maxlen=2048)
+        self._decode_read_samples_ms = collections.deque(maxlen=2048)
+        self._resize_samples_ms = collections.deque(maxlen=2048)
+        self._color_samples_ms = collections.deque(maxlen=2048)
+        self._qimage_samples_ms = collections.deque(maxlen=2048)
+        self._seek_samples_ms = collections.deque(maxlen=256)
+        self._grab_samples_ms = collections.deque(maxlen=256)
 
-    @staticmethod
-    def _to_qimage(frame, target_width):
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    def _to_qimage(self, frame, target_width):
+        conversion_started = perf_counter()
         h, w = frame.shape[:2]
+        resize_started = perf_counter()
         if w > target_width:
             nw = target_width
             nh = int(h * nw / w)
             frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        self._resize_samples_ms.append((perf_counter() - resize_started) * 1000.0)
+        # Downscale before colour conversion: the output is identical at the
+        # target resolution while substantially reducing converted pixels.
+        color_started = perf_counter()
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self._color_samples_ms.append((perf_counter() - color_started) * 1000.0)
         h, w, ch = frame.shape
-        return QImage(frame.data, w, h, ch * w,
-                      QImage.Format_RGB888).copy()
+        image_started = perf_counter()
+        image = QImage(frame.data, w, h, ch * w, QImage.Format_RGB888).copy()
+        self._qimage_samples_ms.append((perf_counter() - image_started) * 1000.0)
+        self._conversion_samples_ms.append(
+            (perf_counter() - conversion_started) * 1000.0)
+        return image
 
     def _cache_put_unlocked(self, frame_number, image):
         self._cache[frame_number] = image
@@ -225,18 +314,26 @@ class PrefetchDecoder(QThread):
         return image
 
     def run(self):
-        cap = _safe_video_capture(self._video_path)
+        cap = _safe_video_capture(
+            self._video_path, decoder_threads=DECODE_THREADS_PER_VIEW)
         if cap is None:
             print(f"[Decoder] Cannot open: {self._video_path.name}")
             return
 
         self.total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        fourcc_value = int(cap.get(cv2.CAP_PROP_FOURCC) or 0)
+        fourcc = "".join(chr((fourcc_value >> (8 * idx)) & 0xFF)
+                         for idx in range(4)).strip("\x00 ").lower()
+        self._all_frames_keyframes = fourcc in {"mjpg", "jpeg", "mjpa", "mjpb"}
         self._current_pos = 0
-        # Keyframe index for reference-safe random seeks (HEVC/H.264):
-        # a raw cap.set() into mid-GOP decodes P/B frames without their
-        # references and yields gray/corrupt frames until the next keyframe.
-        self._keyframes = probe_keyframe_index(self._video_path, self.fps)
+        # A persistent index is cheap to load.  A cold full packet scan is
+        # deliberately deferred until after the first frame is delivered.
+        # Before it is ready, random seeks decode safely from frame zero.
+        try:
+            self._keyframes = get_keyframes(self._video_path) or []
+        except OSError:
+            self._keyframes = []
 
         try:
             while True:
@@ -262,12 +359,37 @@ class PrefetchDecoder(QThread):
 
     def _keyframe_anchor(self, target: int):
         """Largest keyframe frame number <= target, or None without index."""
+        if self._all_frames_keyframes:
+            return target
         if not self._keyframes:
             return None
         idx = bisect.bisect_right(self._keyframes, target) - 1
         if idx < 0:
             return None
         return self._keyframes[idx]
+
+    def _ensure_keyframe_index_started(self):
+        if self._all_frames_keyframes or self._keyframes or self._index_thread is not None:
+            return
+        cache_key = str(self._video_path.resolve())
+        with _KEYFRAME_SCAN_LOCKS_GUARD:
+            scan_lock = _KEYFRAME_SCAN_LOCKS.setdefault(cache_key, threading.Lock())
+
+        def build():
+            with scan_lock:
+                index = probe_keyframe_index(self._video_path, self.fps)
+            with self._condition:
+                self._keyframes = index
+                try:
+                    packet_count = get_packet_count(self._video_path)
+                except OSError:
+                    packet_count = None
+                if packet_count:
+                    self.total_frames = min(self.total_frames, packet_count)
+
+        self._index_thread = threading.Thread(
+            target=build, name=f"mvsp-index-{self._video_path.name}", daemon=True)
+        self._index_thread.start()
 
     def _decode_request(self, cap, request):
         request_id, target, requested_at = request
@@ -287,13 +409,18 @@ class PrefetchDecoder(QThread):
             # SEEK_KEYFRAME_DECODE_MARGIN frames as cached reads.
             anchor = self._keyframe_anchor(target)
             if anchor is None:
-                anchor = target
+                # Never seek into a possibly inter-coded GOP before the index
+                # is ready.  Decoding from zero is slower but reference-safe.
+                anchor = 0
+            seek_started = perf_counter()
             cap.set(cv2.CAP_PROP_POS_FRAMES, anchor)
+            self._seek_samples_ms.append((perf_counter() - seek_started) * 1000.0)
             current_pos = anchor
             with self._condition:
                 self._current_pos = anchor
                 self._random_seeks += 1
             grab_stop = max(anchor, target - SEEK_KEYFRAME_DECODE_MARGIN)
+            grab_started = perf_counter()
             while current_pos < grab_stop:
                 if not cap.grab():
                     with self._condition:
@@ -309,9 +436,13 @@ class PrefetchDecoder(QThread):
                     self._decoded_frames += 1
                     if request_id != self._latest_request_id:
                         return
+            self._grab_samples_ms.append((perf_counter() - grab_started) * 1000.0)
 
         while current_pos <= target:
+            read_started = perf_counter()
             ret, frame = cap.read()
+            self._decode_read_samples_ms.append(
+                (perf_counter() - read_started) * 1000.0)
             if not ret:
                 with self._condition:
                     is_latest = request_id == self._latest_request_id
@@ -337,12 +468,16 @@ class PrefetchDecoder(QThread):
 
             if frame_number == target:
                 self.frame_ready.emit(request_id, frame_number, qimg)
+                self._ensure_keyframe_index_started()
                 return
 
     def _decode_playback_frame(self, cap):
         with self._condition:
             frame_number = self._current_pos
+        read_started = perf_counter()
         ret, frame = cap.read()
+        self._decode_read_samples_ms.append(
+            (perf_counter() - read_started) * 1000.0)
         if not ret:
             with self._condition:
                 self._state = "paused"
@@ -355,6 +490,7 @@ class PrefetchDecoder(QThread):
             # A newly queued seek supersedes playback work already in flight.
             if self._seek_request is None:
                 self._buffer.append((frame_number, qimg))
+        self._ensure_keyframe_index_started()
 
     # ---- Consumer interface (main thread) ----
 
@@ -422,6 +558,18 @@ class PrefetchDecoder(QThread):
 
     def metrics(self):
         with self._condition:
+            def distribution(values):
+                samples = sorted(values)
+                if not samples:
+                    return {"median": 0.0, "p95": 0.0, "max": 0.0, "samples": 0}
+                at = lambda fraction: samples[min(
+                    len(samples) - 1, int((len(samples) - 1) * fraction))]
+                return {
+                    "median": round(at(0.5), 3),
+                    "p95": round(at(0.95), 3),
+                    "max": round(samples[-1], 3),
+                    "samples": len(samples),
+                }
             return {
                 "buffer_occupancy": len(self._buffer),
                 "buffer_capacity": self._buffer_size,
@@ -437,6 +585,14 @@ class PrefetchDecoder(QThread):
                 "random_seeks": self._random_seeks,
                 "decoded_frames": self._decoded_frames,
                 "decoder_position": self._current_pos,
+                "keyframe_index_ready": bool(self._keyframes),
+                "decode_read_ms": distribution(self._decode_read_samples_ms),
+                "resize_ms": distribution(self._resize_samples_ms),
+                "bgr_to_rgb_ms": distribution(self._color_samples_ms),
+                "numpy_to_qimage_copy_ms": distribution(self._qimage_samples_ms),
+                "convert_qimage_total_ms": distribution(self._conversion_samples_ms),
+                "random_cap_seek_ms": distribution(self._seek_samples_ms),
+                "keyframe_fast_forward_grab_ms": distribution(self._grab_samples_ms),
             }
 
     def stop(self):

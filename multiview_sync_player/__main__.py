@@ -21,22 +21,15 @@ def main():
                         help='Open a saved .mvsp.json session file')
     parser.add_argument('--library', type=str, default=None,
                         help='Open a media library root directory on startup')
-    parser.add_argument('--backend', default='opencv',
-                        choices=['opencv', 'mpv'],
-                        help='Video decode backend (default: opencv)')
+    parser.add_argument('--backend', default='auto',
+                        choices=['auto', 'precision', 'gpu', 'opencv', 'mpv'],
+                        help='Playback backend (default: auto; exact-frame gated)')
     args = parser.parse_args()
-
-    # Try mpv backend
-    if args.backend == 'mpv':
-        try:
-            import mpv
-        except OSError:
-            print("[Warning] mpv DLL not found, falling back to opencv backend")
-            print("  Download: https://github.com/shinchiro/mpv-winbuild-cmake/releases")
-            args.backend = 'opencv'
 
     from PySide6.QtWidgets import QApplication, QDialog
     app = QApplication.instance() or QApplication(sys.argv)
+    app.setApplicationName("MultiViewSyncPlayer")
+    app.setOrganizationName("MultiViewSyncPlayer")
     app.setStyle('Fusion')
 
     from .main_window import MainWindow

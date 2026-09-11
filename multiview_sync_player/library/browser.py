@@ -33,6 +33,7 @@ from PySide6.QtGui import QStandardItemModel, QStandardItem
 
 from .index import LibraryIndex, load_index, rebuild_index
 from .schema import DateEntry, ExperimentEntry, SubjectEntry, ViewEntry
+from ..process_utils import popen_hidden
 
 # ---------------------------------------------------------------------------
 # Node roles
@@ -422,17 +423,16 @@ class LibraryBrowserDock(QDockWidget):
                     self._show_in_explorer(exp_dir)
 
     def _show_in_explorer(self, path: Path):
-        import subprocess
         import platform
         path_str = str(path)
         system = platform.system()
         try:
             if system == "Windows":
-                subprocess.Popen(f'explorer /select,"{path_str}"')
+                popen_hidden(["explorer.exe", f"/select,{path_str}"])
             elif system == "Darwin":
-                subprocess.Popen(["open", "-R", path_str])
+                popen_hidden(["open", "-R", path_str])
             else:
-                subprocess.Popen(["xdg-open", str(path.parent)])
+                popen_hidden(["xdg-open", str(path.parent)])
         except Exception:
             pass
 

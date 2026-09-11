@@ -24,6 +24,9 @@ PLAYER_CONFIG_PATH = _CONFIG_DIR / "config.json"
 # "opencv" = OpenCV multi-threaded decode (default, no DLL needed)
 # "mpv" = mpv GPU hardware decode (requires libmpv DLL)
 BACKEND = "opencv"
+BACKEND_MODE = "Strict"
+BACKEND_REQUESTED = "auto"
+BACKEND_REASON = ""
 
 # ---- FFmpeg auto-detect ----
 
@@ -84,6 +87,12 @@ FFPROBE_PATH = _find_ffprobe()
 
 # ---- OpenCV backend params ----
 DECODE_TARGET_WIDTH = 720
+# OpenCV/FFmpeg otherwise defaults to all logical CPUs per VideoCapture.  Six
+# views then create ~96 codec workers on a 16-thread machine.  Four workers per
+# view was the best balanced Windows result for the mixed 720p/1440p workload.
+DECODE_THREADS_PER_VIEW = max(1, int(os.environ.get("MVSP_DECODE_THREADS", "4")))
+OPENCV_INTERNAL_THREADS = max(
+    1, int(os.environ.get("MVSP_OPENCV_THREADS", "4")))
 DECODE_BUFFER_SIZE = 60   # ring buffer prefetch size
 RECENT_FRAME_CACHE_SIZE = 64
 SEQUENTIAL_STEP_WINDOW = 16

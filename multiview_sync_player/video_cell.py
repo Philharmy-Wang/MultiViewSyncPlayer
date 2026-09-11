@@ -10,9 +10,11 @@ Contains video display + info overlay + progress bar + control buttons
 Supports double-click to select video file.
 """
 
+import collections
 import os
 import subprocess
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 
@@ -20,7 +22,9 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider,
     QSizePolicy, QFileDialog, QFrame, QApplication,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QRect, QPoint, QMimeData, QByteArray
+from PySide6.QtCore import (
+    Qt, QTimer, QThread, Signal, QRect, QPoint, QMimeData, QByteArray,
+)
 from PySide6.QtGui import (
     QImage, QPixmap, QPainter, QColor, QPen, QFont, QPolygon, QCursor, QDrag,
 )
@@ -35,6 +39,69 @@ from . import config as cfg
 from .styles import CELL_BTN_STYLE, PROGRESS_SLIDER_STYLE
 from .waveform_bar import WaveformBar
 from .video_decoder import PrefetchDecoder
+from .process_utils import popen_hidden
+from .backend import frame_to_time
+
+
+def _distribution(values):
+    samples = sorted(values)
+    if not samples:
+        return {"median": 0.0, "p95": 0.0, "max": 0.0, "samples": 0}
+    at = lambda fraction: samples[min(
+        len(samples) - 1, int((len(samples) - 1) * fraction))]
+    return {
+        "median": round(at(0.5), 3), "p95": round(at(0.95), 3),
+        "max": round(samples[-1], 3), "samples": len(samples),
+    }
+
+
+class AudioLoadThread(QThread):
+    """Extract and reduce one audio stream without blocking Qt's GUI thread."""
+
+    audio_ready = Signal(object, int, bool, str)
+
+    def __init__(self, video_path: str, wav_path: Path, parent=None):
+        super().__init__(parent)
+        self.video_path = video_path
+        self.wav_path = wav_path
+        self._process = None
+
+    def run(self):
+        try:
+            cmd = [FFMPEG_PATH, "-y", "-i", self.video_path,
+                   "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                   str(self.wav_path)]
+            self._process = popen_hidden(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            while self._process.poll() is None:
+                if self.isInterruptionRequested():
+                    self._process.terminate()
+                    self._process.wait(timeout=3)
+                    self.audio_ready.emit(None, 0, False, "cancelled")
+                    return
+                self.msleep(50)
+            if self._process.returncode != 0 or not self.wav_path.is_file():
+                self.audio_ready.emit(None, 0, False, "ffmpeg extraction failed")
+                return
+            import scipy.io.wavfile as wavfile
+            sr, data = wavfile.read(str(self.wav_path))
+            if data.ndim > 1:
+                data = data[:, 0]
+            data = data.astype(np.float64)
+            mx = np.max(np.abs(data)) if len(data) else 0
+            if mx > 0:
+                data = data / mx
+            spp = 1600
+            n = max(1, len(data) // spp)
+            env = np.zeros(n)
+            for index in range(n):
+                chunk = data[index * spp:(index + 1) * spp]
+                env[index] = np.max(np.abs(chunk)) if len(chunk) else 0
+            self.audio_ready.emit(env, sr, True, "")
+        except Exception as exc:
+            self.audio_ready.emit(None, 0, False, str(exc))
+        finally:
+            self._process = None
 
 
 # ==================== Draggable color header ====================
@@ -113,9 +180,11 @@ class OverlayWidget(QWidget):
         self.is_enabled = True
         self.synced = True
         self.seek_pending = False
+        self._paint_samples_ms = collections.deque(maxlen=2048)
         self.setMouseTracking(True)
 
     def paintEvent(self, event):
+        started = perf_counter()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
@@ -126,6 +195,7 @@ class OverlayWidget(QWidget):
             painter.setFont(QFont("Microsoft YaHei", 12))
             painter.drawText(QRect(0, 0, w, h), Qt.AlignCenter, "已禁用")
             painter.end()
+            self._paint_samples_ms.append((perf_counter() - started) * 1000.0)
             return
 
         bg = QColor(0, 0, 0, 165)
@@ -205,6 +275,7 @@ class OverlayWidget(QWidget):
             painter.fillRect(1, by, int((w - 2) * prog), bh, QColor(COLOR_ACCENT))
 
         painter.end()
+        self._paint_samples_ms.append((perf_counter() - started) * 1000.0)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -224,6 +295,8 @@ class VideoDisplay(QWidget):
         self._pixmap = None
         self._cached_scaled = None
         self._cached_size = None
+        self._paint_samples_ms = collections.deque(maxlen=2048)
+        self._scale_samples_ms = collections.deque(maxlen=2048)
         self.setMinimumSize(200, 120)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet("background: #1a1a1a;")
@@ -237,25 +310,33 @@ class VideoDisplay(QWidget):
         """
         if pixmap is None or pixmap.isNull():
             return
+        if (self._pixmap is not None
+                and self._pixmap.cacheKey() == pixmap.cacheKey()):
+            return
         self._pixmap = pixmap
         self._cached_scaled = None
         self.update()
 
     def paintEvent(self, event):
+        started = perf_counter()
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#1a1a1a"))
         if self._pixmap:
             w, h = self.width(), self.height()
             size = (w, h)
             if self._cached_size != size or self._cached_scaled is None:
+                scale_started = perf_counter()
                 self._cached_scaled = self._pixmap.scaled(
                     w, h, Qt.KeepAspectRatio, Qt.FastTransformation)
+                self._scale_samples_ms.append(
+                    (perf_counter() - scale_started) * 1000.0)
                 self._cached_size = size
             scaled = self._cached_scaled
             x = (w - scaled.width()) // 2
             y = (h - scaled.height()) // 2
             painter.drawPixmap(x, y, scaled)
         painter.end()
+        self._paint_samples_ms.append((perf_counter() - started) * 1000.0)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -281,6 +362,7 @@ class VideoCell(QWidget):
     video_file_selected = Signal(str, str)
     seek_frame_ready = Signal(str, int, int, object)
     seek_frame_failed = Signal(str, int, int, str)
+    audio_load_finished = Signal(str)
 
     def __init__(self, view_name: str, temp_dir: str, parent=None):
         super().__init__(parent)
@@ -306,6 +388,8 @@ class VideoCell(QWidget):
         self._display_counter = 0  # throttle non-critical UI updates
         self._latest_seek_request_id = 0
         self._local_seek_generation = 0
+        self._audio_worker = None
+        self._pixmap_samples_ms = collections.deque(maxlen=2048)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -520,7 +604,10 @@ class VideoCell(QWidget):
         """
         if qimg is None or qimg.isNull():
             return  # keep last good frame visible
+        pixmap_started = perf_counter()
         pixmap = QPixmap.fromImage(qimg)
+        self._pixmap_samples_ms.append(
+            (perf_counter() - pixmap_started) * 1000.0)
         self._pixmap = pixmap
         self._last_good_pixmap = pixmap
         self.current_frame = frame_idx
@@ -558,7 +645,7 @@ class VideoCell(QWidget):
         self._latest_seek_request_id = request_id
         if cfg.BACKEND == "mpv" and self.player and self.fps > 0:
             self.player.pause = True
-            self.player.time_pos = frame / self.fps
+            self.player.time_pos = frame_to_time(frame, self.fps)
             self.current_frame = frame
             self.overlay.current_frame = frame
             self.overlay.update()
@@ -589,6 +676,41 @@ class VideoCell(QWidget):
     def set_speed(self, speed: float):
         if cfg.BACKEND == "mpv" and self.player:
             self.player.speed = speed
+
+    def backend_status(self, fallback_codec=""):
+        """Return runtime decode facts suitable for the status bar."""
+        if not self.player:
+            return {
+                "backend": "opencv", "codec": fallback_codec or "unknown",
+                "hwdec_current": "none", "gpu_decode_active": False,
+                "dropped_frames": 0,
+            }
+        def value(name, default=None):
+            try:
+                result = getattr(self.player, name)
+                return default if result is None else result
+            except Exception:
+                return default
+        hwdec = str(value("hwdec_current", "none"))
+        decoder_drops = int(value("decoder_frame_drop_count", 0) or 0)
+        vo_drops = int(value("vo_drop_frame_count", 0) or 0)
+        return {
+            "backend": "mpv",
+            "codec": str(value("video_codec", fallback_codec or "unknown")),
+            "hwdec_current": hwdec,
+            "gpu_decode_active": hwdec.lower() not in {"", "no", "none"},
+            "dropped_frames": decoder_drops + vo_drops,
+        }
+
+    def performance_metrics(self):
+        return {
+            "qimage_to_qpixmap_ms": _distribution(self._pixmap_samples_ms),
+            "widget_scale_ms": _distribution(
+                getattr(self.video_frame, "_scale_samples_ms", ())),
+            "widget_paint_ms": _distribution(
+                getattr(self.video_frame, "_paint_samples_ms", ())),
+            "overlay_paint_ms": _distribution(self.overlay._paint_samples_ms),
+        }
 
     def set_selected(self, selected: bool):
         self.overlay.is_selected = selected
@@ -717,30 +839,19 @@ class VideoCell(QWidget):
 
     def load_audio(self, video_path: str):
         wav_path = Path(self.temp_dir) / f"{self.view_name}.wav"
-        try:
-            cmd = [FFMPEG_PATH, "-y", "-i", video_path,
-                   "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                   str(wav_path)]
-            subprocess.run(cmd, stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, timeout=60)
-            if wav_path.exists() and wav_path.stat().st_size > 0:
-                import scipy.io.wavfile as wavfile
-                sr, data = wavfile.read(str(wav_path))
-                if data.ndim > 1:
-                    data = data[:, 0]
-                data = data.astype(np.float64)
-                mx = np.max(np.abs(data))
-                if mx > 0:
-                    data = data / mx
-                spp = 1600
-                n = max(1, len(data) // spp)
-                env = np.zeros(n)
-                for i in range(n):
-                    env[i] = np.max(np.abs(data[i * spp:(i + 1) * spp]))
-                self.has_audio = True
-                self.waveform.set_audio(env, sr)
-        except Exception as e:
-            print(f"音频加载失败 [{self.view_name}]: {e}")
+        if self._audio_worker and self._audio_worker.isRunning():
+            return
+        self._audio_worker = AudioLoadThread(video_path, wav_path, self)
+        self._audio_worker.audio_ready.connect(self._on_audio_ready)
+        self._audio_worker.start()
+
+    def _on_audio_ready(self, envelope, sr, ok, message):
+        if ok:
+            self.has_audio = True
+            self.waveform.set_audio(envelope, sr)
+        elif message not in ("", "cancelled"):
+            print(f"音频加载失败 [{self.view_name}]: {message}")
+        self.audio_load_finished.emit(self.view_name)
 
     # ---- Cleanup ----
 
@@ -751,6 +862,10 @@ class VideoCell(QWidget):
         if self.decoder:
             self.decoder.stop()
             self.decoder = None
+        if self._audio_worker and self._audio_worker.isRunning():
+            self._audio_worker.requestInterruption()
+            self._audio_worker.wait(4000)
+        self._audio_worker = None
         if self.player:
             try:
                 self.player.pause = True
