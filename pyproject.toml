@@ -36,6 +36,9 @@ dev = [
     "pytest>=7.0",
     "ruff>=0.1",
 ]
+hardware = [
+    "python-mpv>=1.0.7",
+]
 
 [project.scripts]
 multiview-sync-player = "multiview_sync_player.__main__:main"
