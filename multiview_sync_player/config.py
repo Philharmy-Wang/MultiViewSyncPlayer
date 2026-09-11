@@ -88,6 +88,10 @@ DECODE_BUFFER_SIZE = 60   # ring buffer prefetch size
 RECENT_FRAME_CACHE_SIZE = 64
 SEQUENTIAL_STEP_WINDOW = 16
 SEEK_TIMEOUT_MS = 2000
+# Session opening may need more time for six cold decoders. This only applies
+# to the first seek after an automatic session load; normal seeks stay at the
+# short barrier timeout above.
+INITIAL_SESSION_LOAD_TIMEOUT_MS = 20000
 # After a keyframe-anchored random seek, the last N frames before the
 # target are decoded with full read+cache; the bulk is grab()-skipped.
 SEEK_KEYFRAME_DECODE_MARGIN = 8

@@ -62,11 +62,13 @@ class LayoutConfig:
         return {vn: pos for vn, pos in zip(self.view_names, self.positions())}
 
     def to_dict(self) -> dict:
+        colors = [color if isinstance(color, str) else color.name()
+                  for color in self.view_colors]
         return {
             "rows": self.rows,
             "cols": self.cols,
             "view_names": list(self.view_names),
-            "view_colors": list(self.view_colors),
+            "view_colors": colors,
         }
 
     @classmethod

@@ -23,6 +23,7 @@ from PySide6.QtGui import QShortcut, QKeySequence, QAction
 
 from .config import (
     SPEED_STEPS, PLAYER_CONFIG_PATH, SEEK_TIMEOUT_MS,
+    INITIAL_SESSION_LOAD_TIMEOUT_MS,
     COLOR_PANEL_BG, COLOR_ACCENT, COLOR_TEXT, COLOR_TEXT_DIM,
     VIEW_COLORS,
 )
@@ -37,6 +38,8 @@ from .metadata import SessionMetadata
 from .layout_manager import LayoutConfig, fit_layout_to_views
 from .session_io import (
     SessionData, save_session, load_session, detect_library_ref,
+    SessionFormatError, SessionResolutionError, discover_legacy_video_manifests,
+    resolve_session_videos,
 )
 from .library.browser import LibraryBrowserDock
 from .library.import_wizard import ImportWizard
@@ -200,6 +203,8 @@ class MainWindow(QMainWindow):
         self._play_started_at = None
         self._fps_warning = ""
         self._backend_init_complete = True
+        self._initial_session_loading = False
+        self._pending_review_state = None
         self.metadata = SessionMetadata()
         self.cells = {}
         self._slot_widgets = {}
@@ -479,7 +484,7 @@ class MainWindow(QMainWindow):
     def _on_session_open(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "打开会话", "",
-            "会话文件 (*.mvsp.json);;JSON 文件 (*.json);;所有文件 (*)")
+            "会话文件 (*.mvsp.json *.mvsp);;JSON 文件 (*.json);;所有文件 (*)")
         if path:
             self._load_session(path)
 
@@ -505,7 +510,7 @@ class MainWindow(QMainWindow):
             self._update_title()
 
     def _load_session(self, path: str):
-        from .session_io import SessionFormatError
+        path = str(Path(path).resolve())
         try:
             data = load_session(path)
         except SessionFormatError as e:
@@ -515,9 +520,139 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "加载失败", f"无法加载会话文件:\n{e}")
             return
 
+        try:
+            # A legacy alignment can contain offsets/layout only. Its video
+            # discovery is deliberately strict and stays inside this subject
+            # directory; it never scans the whole drive.
+            if not data.video_manifests:
+                data.video_manifests = discover_legacy_video_manifests(path, data)
+                self._add_cells_for_manifests(data)
+
+            resolutions = self._resolve_session_data(data, path)
+            missing = [item for item in resolutions.values() if item.path is None]
+            if missing:
+                resolutions = self._offer_session_relocation(data, path, resolutions)
+                if resolutions is None:
+                    return
+
+            # Re-check mismatches after a relocation/file selection. A path
+            # being found is not enough to accept a different video silently.
+            mismatches = [item for item in resolutions.values()
+                          if item.path is not None and item.identity_ok is False]
+            if mismatches:
+                summary = "\n".join(
+                    f"{item.view_name}: {item.identity_message}\n"
+                    f"相对路径: {item.relative_path or '(无)'}\n"
+                    f"绝对路径: {item.absolute_path or '(无)'}"
+                    for item in mismatches)
+                answer = QMessageBox.warning(
+                    self, "视频身份校验不一致",
+                    "以下文件与会话记录不一致，可能被替换。\n\n" + summary
+                    + "\n\n是否明确确认仍然打开这些文件？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if answer != QMessageBox.Yes:
+                    return
+                for item in mismatches:
+                    item.identity_ok = True
+
+            missing = [item for item in resolutions.values() if not item.ok]
+            if missing:
+                summary = "\n".join(
+                    f"{item.view_name}: expected {item.relative_path or '(no relative path)'}"
+                    f"\n  old absolute: {item.absolute_path or '(none)'}"
+                    for item in missing)
+                answer = QMessageBox.warning(
+                    self, "会话视频不完整",
+                    f"{len(missing)}/{len(resolutions)} 个视频无法安全解析:\n\n"
+                    + summary
+                    + "\n\n选择“是”将只打开已解析视角；选择“否”取消。",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if answer != QMessageBox.Yes:
+                    return
+
+            self._apply_resolutions(data, resolutions)
+        except SessionResolutionError as e:
+            QMessageBox.warning(self, "旧版会话无法自动迁移", str(e))
+            return
+
         self._clear_all()
         self.controller.session_path = path
         self._apply_session_data(data)
+
+    @staticmethod
+    def _add_cells_for_manifests(data):
+        """Materialize compact cell entries for a legacy no-video session."""
+        existing = {cell["view_name"] for cell in data.cells}
+        offsets = data.global_state.get("offsets", {})
+        for vn, manifest in data.video_manifests.items():
+            if vn in existing:
+                continue
+            data.cells.append({
+                "view_name": vn,
+                "video_path": manifest.get("path", ""),
+                "total_frames": manifest.get("total_frames", 0),
+                "fps": manifest.get("fps", 0.0),
+                "has_audio": manifest.get("has_audio", False),
+                "offset": offsets.get(vn, 0),
+            })
+
+    def _resolve_session_data(self, data, path, search_root=None):
+        """Resolve paths and validate identities after probing actual files."""
+        initial = resolve_session_videos(data, path, search_root)
+        actual = {}
+        for vn, item in initial.items():
+            if item.path is not None:
+                actual[vn] = probe_video_metadata(str(item.path))
+        return resolve_session_videos(data, path, search_root, actual)
+
+    def _offer_session_relocation(self, data, path, resolutions):
+        """Offer one subject-root selection and one-file repair when needed."""
+        missing = [item for item in resolutions.values() if item.path is None]
+        if not missing:
+            return resolutions
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("找不到会话视频")
+        msg.setText("部分视频无法按相对路径或旧绝对路径找到。")
+        locate_root = msg.addButton("定位会话根目录…", QMessageBox.AcceptRole)
+        locate_file = msg.addButton("定位一个文件…", QMessageBox.ActionRole)
+        partial = msg.addButton("打开部分会话", QMessageBox.DestructiveRole)
+        msg.addButton("取消", QMessageBox.RejectRole)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked == locate_root:
+            root = QFileDialog.getExistingDirectory(
+                self, "选择 relocated subject/session 根目录", str(Path(path).parent))
+            if root:
+                return self._resolve_session_data(data, path, Path(root))
+        elif clicked == locate_file:
+            target = missing[0]
+            selected, _ = QFileDialog.getOpenFileName(
+                self, f"定位 {target.view_name}", str(Path(path).parent),
+                "视频文件 (*.mp4 *.MP4 *.avi *.mkv *.mov);;所有文件 (*)")
+            if selected:
+                manifest = data.video_manifests[target.view_name]
+                manifest["path"] = selected
+                manifest["file_name"] = Path(selected).name
+                return self._resolve_session_data(data, path)
+        elif clicked == partial:
+            return resolutions
+        return None
+
+    @staticmethod
+    def _apply_resolutions(data, resolutions):
+        """Replace manifest/cell paths with the verified path chosen to open."""
+        cells = []
+        for cell in data.cells:
+            item = resolutions.get(cell["view_name"])
+            if item is None or not item.ok:
+                continue
+            cell = dict(cell)
+            cell["video_path"] = str(item.path)
+            data.video_manifests.setdefault(cell["view_name"], {})["path"] = str(item.path)
+            cells.append(cell)
+        data.cells = cells
 
     # ---- 播放控制 ----
 
@@ -685,7 +820,9 @@ class MainWindow(QMainWindow):
             self._update_status()
             return
 
-        self._seek_timeout_timer.start(SEEK_TIMEOUT_MS)
+        timeout = (INITIAL_SESSION_LOAD_TIMEOUT_MS
+                   if self._initial_session_loading else SEEK_TIMEOUT_MS)
+        self._seek_timeout_timer.start(timeout)
         for view, target in targets.items():
             participants[view].set_seek_pending(True)
             participants[view].seek_to_frame(
@@ -708,6 +845,7 @@ class MainWindow(QMainWindow):
             return
         self._seek_timeout_timer.stop()
         self._set_all_seek_pending(False)
+        self._initial_session_loading = False
         self._last_seek_latency_ms = request.latency_ms
 
         # All QPixmap/overlay/slider writes happen in this one UI callback.
@@ -746,6 +884,7 @@ class MainWindow(QMainWindow):
             "Seek timeout after retry: " + ", ".join(missing))
         self._seek_barrier.cancel(request.generation)
         self._set_all_seek_pending(False)
+        self._initial_session_loading = False
         self._update_status()
 
     def _toggle_debug_metrics(self, visible):
@@ -820,6 +959,10 @@ class MainWindow(QMainWindow):
             "total_frames": meta["total_frames"],
             "fps": meta["fps"],
             "has_audio": meta["has_audio"],
+            "width": meta.get("width", 0),
+            "height": meta.get("height", 0),
+            "duration_sec": meta.get("duration_sec", 0.0),
+            "codec": meta.get("codec", ""),
         }
         self.controller.offsets.setdefault(view_name, 0)
         self.controller.enabled_views.add(view_name)
@@ -904,9 +1047,28 @@ class MainWindow(QMainWindow):
     def _init_next_backend(self):
         if not self._backend_queue:
             self._backend_init_complete = True
-            self.controller.base_frame = 0
+            pending = self._pending_review_state
+            if pending is None:
+                self.controller.base_frame = 0
+            else:
+                max_base = self.controller._max_base_frame()
+                self.controller.base_frame = max(
+                    0, min(int(pending.get("base_frame", 0)), max_base))
+                for vn, state in pending.get("per_view", {}).items():
+                    cell = self.cells.get(vn)
+                    if cell is None or cell.synced:
+                        continue
+                    last = max(0, cell.total_frames - 1)
+                    target = state.get("local_frame", state.get(
+                        "displayed_frame", self.controller.base_frame
+                        + self.controller.offsets.get(vn, 0)))
+                    target = max(0, min(int(target), last))
+                    cell.local_frame = target
+                    cell.waveform.set_base_frame(target)
+                    cell.seek_to_frame(target)
+            self._pending_review_state = None
             self._refresh_fps_warning()
-            self._on_base_frame_changed(0)
+            self._on_base_frame_changed(self.controller.base_frame)
             self._start_audio_loading()
             self._update_title()
             return
@@ -1088,7 +1250,8 @@ class MainWindow(QMainWindow):
     # ---- 保存 ----
 
     def _save(self):
-        if not self.controller.session_path:
+        if (not self.controller.session_path
+                or not str(self.controller.session_path).lower().endswith(".mvsp.json")):
             self._save_as()
         else:
             data = self._collect_session_data()
@@ -1098,9 +1261,13 @@ class MainWindow(QMainWindow):
     def _save_as(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "保存会话", "",
-            "会话文件 (*.mvsp.json);;JSON 文件 (*.json);;所有文件 (*)")
+            "会话文件 (*.mvsp.json *.mvsp);;JSON 文件 (*.json);;所有文件 (*)")
         if path:
-            if not path.endswith(".json"):
+            if path.lower().endswith(".json") and not path.lower().endswith(".mvsp.json"):
+                path = path[:-5] + ".mvsp.json"
+            elif path.lower().endswith(".mvsp"):
+                path += ".json"
+            elif not path.lower().endswith(".mvsp.json"):
                 path += ".mvsp.json"
             data = self._collect_session_data()
             save_session(path, data)
@@ -1119,17 +1286,36 @@ class MainWindow(QMainWindow):
                 "total_frames": info["total_frames"],
                 "fps": info["fps"],
                 "has_audio": info.get("has_audio", False),
+                "width": info.get("width", 0),
+                "height": info.get("height", 0),
+                "duration_sec": info.get("duration_sec", 0.0),
+                "codec": info.get("codec", ""),
                 "offset": c.offsets.get(vn, 0),
             })
         layout = self.layout_config.to_dict()
+        synced = {vn: bool(cell.synced) for vn, cell in self.cells.items()}
+        review_per_view = {}
+        for vn, cell in self.cells.items():
+            review_per_view[vn] = {
+                "local_frame": int(cell.local_frame),
+                "displayed_frame": int(cell.current_frame),
+            }
         global_state = {
-            "version": "0.1.0",
+            "version": "0.2.0",
             "offsets": dict(c.offsets),
+            "synced": synced,
             "markers": c.markers,
             "metadata": self.metadata.to_dict(),
+            "base_frame": int(c.base_frame),
+            "review_state": {
+                "base_frame": int(c.base_frame),
+                "per_view": review_per_view,
+            },
         }
         from datetime import datetime
-        global_state["created"] = datetime.now().isoformat(timespec="seconds")
+        now = datetime.now().isoformat(timespec="seconds")
+        global_state["created"] = now
+        global_state["updated"] = now
 
         data = SessionData(cells=cells, layout=layout, global_state=global_state)
         data.library_ref = detect_library_ref(
@@ -1152,6 +1338,15 @@ class MainWindow(QMainWindow):
 
         offsets = data.global_state.get("offsets", {})
         markers = data.global_state.get("markers", [])
+        synced = data.global_state.get("synced", {})
+        review = data.global_state.get("review_state", {}) or {}
+        desired_base = data.global_state.get(
+            "base_frame", review.get("base_frame", 0))
+        self._pending_review_state = {
+            "base_frame": int(desired_base or 0),
+            "per_view": review.get("per_view", {}),
+        }
+        self._initial_session_loading = True
 
         for cell in data.cells:
             vn = cell["view_name"]
@@ -1176,10 +1371,18 @@ class MainWindow(QMainWindow):
                 "total_frames": meta["total_frames"],
                 "fps": meta["fps"],
                 "has_audio": meta["has_audio"],
+                "width": meta.get("width", 0),
+                "height": meta.get("height", 0),
+                "duration_sec": meta.get("duration_sec", 0.0),
+                "codec": meta.get("codec", ""),
             }
             self.controller.offsets[vn] = offsets.get(vn, 0)
             self.controller.enabled_views.add(vn)
             self._create_cell(vn, pos[0], pos[1])
+            cell_widget = self.cells[vn]
+            cell_widget.synced = bool(synced.get(vn, True))
+            cell_widget.overlay.synced = cell_widget.synced
+            cell_widget._update_sync_style()
 
         self.controller.markers = markers
         meta_data = data.global_state.get("metadata", {})
@@ -1257,6 +1460,8 @@ class MainWindow(QMainWindow):
         self._ui_timer.stop()
         self.sync_timer.stop()
         self._seek_timeout_timer.stop()
+        self._initial_session_loading = False
+        self._pending_review_state = None
         if self._seek_barrier.active:
             self._seek_barrier.cancel(self._seek_barrier.active.generation)
         for vn, cell in self.cells.items():
@@ -1339,7 +1544,7 @@ class MainWindow(QMainWindow):
             examples_dir = Path(".")
         path, _ = QFileDialog.getOpenFileName(
             self, "打开示例会话", str(examples_dir),
-            "会话文件 (*.mvsp.json);;JSON 文件 (*.json);;所有文件 (*)")
+            "会话文件 (*.mvsp.json *.mvsp);;JSON 文件 (*.json);;所有文件 (*)")
         if path:
             self._load_session(path)
 
@@ -1417,6 +1622,10 @@ class MainWindow(QMainWindow):
                 "total_frames": meta["total_frames"],
                 "fps": meta["fps"],
                 "has_audio": meta["has_audio"],
+                "width": meta.get("width", 0),
+                "height": meta.get("height", 0),
+                "duration_sec": meta.get("duration_sec", 0.0),
+                "codec": meta.get("codec", ""),
             }
             self.controller.offsets.setdefault(vname, 0)
             self.controller.enabled_views.add(vname)
@@ -1531,6 +1740,10 @@ class MainWindow(QMainWindow):
                 "total_frames": meta["total_frames"],
                 "fps": meta["fps"],
                 "has_audio": meta["has_audio"],
+                "width": meta.get("width", 0),
+                "height": meta.get("height", 0),
+                "duration_sec": meta.get("duration_sec", 0.0),
+                "codec": meta.get("codec", ""),
             }
             self.controller.offsets[vn] = 0
             self.controller.enabled_views.add(vn)

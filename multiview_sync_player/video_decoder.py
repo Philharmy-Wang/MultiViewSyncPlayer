@@ -63,18 +63,24 @@ def _safe_video_capture(path):
 # ==================== Video metadata probe ====================
 
 def probe_video_metadata(video_path: str) -> dict:
-    """Probe video file for fps, total_frames, has_audio.
-
-    Returns dict with keys: path, fps, total_frames, has_audio.
-    """
+    """Probe video metadata used by playback and session identity checks."""
     from pathlib import Path
     cap = _safe_video_capture(video_path)
     if cap is None or not cap.isOpened():
         return {"path": str(video_path), "fps": 25.0, "total_frames": 0,
-                "has_audio": False}
+                "has_audio": False, "width": 0, "height": 0,
+                "duration_sec": 0.0, "codec": ""}
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    duration = total / fps if fps > 0 and total > 0 else 0.0
+    fourcc_value = int(cap.get(cv2.CAP_PROP_FOURCC) or 0)
+    codec = ""
+    if fourcc_value:
+        codec = "".join(chr((fourcc_value >> (8 * idx)) & 0xFF)
+                        for idx in range(4)).strip("\x00 ")
     cap.release()
 
     # Audio detection: check file extension and try ffprobe-like approach
@@ -86,6 +92,10 @@ def probe_video_metadata(video_path: str) -> dict:
         "fps": fps,
         "total_frames": total,
         "has_audio": has_audio,
+        "width": width,
+        "height": height,
+        "duration_sec": duration,
+        "codec": codec,
     }
 
 
