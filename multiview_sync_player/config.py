@@ -28,6 +28,15 @@ BACKEND_MODE = "Strict"
 BACKEND_REQUESTED = "auto"
 BACKEND_REASON = ""
 
+# MPV remains an explicitly selected Preview backend until its displayed-frame
+# acknowledgement passes the exact-frame gate.  Keeping the hwdec choice
+# configurable lets Linux validation compare auto and NVDEC without changing
+# the correctness policy or hard-coding a host-specific driver assumption.
+MPV_HWDEC = os.environ.get("MVSP_MPV_HWDEC", "auto").strip().lower()
+if MPV_HWDEC not in {"auto", "nvdec", "no"}:
+    MPV_HWDEC = "auto"
+MPV_VO = os.environ.get("MVSP_MPV_VO", "gpu-next").strip() or "gpu-next"
+
 # ---- FFmpeg auto-detect ----
 
 

@@ -547,8 +547,8 @@ class VideoCell(QWidget):
     def _init_mpv(self, video_path: str):
         try:
             import mpv
-        except OSError:
-            print("[Warning] mpv DLL not found, falling back to OpenCV backend")
+        except (ImportError, OSError) as exc:
+            print(f"[Warning] libmpv unavailable ({exc}), falling back to OpenCV backend")
             self._init_opencv(video_path)
             return
 
@@ -570,7 +570,7 @@ class VideoCell(QWidget):
 
         wid = str(int(self.video_frame.winId()))
         self.player = mpv.MPV(
-            wid=wid, hwdec='auto', vo='gpu', pause=True, audio=False,
+            wid=wid, hwdec=cfg.MPV_HWDEC, vo=cfg.MPV_VO, pause=True, audio=False,
             keep_open='yes', loop='no', hr_seek='yes',
             hr_seek_framedrop='no', demuxer_max_bytes='50MiB', quiet=True,
         )

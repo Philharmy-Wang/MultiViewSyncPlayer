@@ -323,10 +323,25 @@ def load_session(path: Path) -> SessionData:
 
 
 def discover_legacy_video_manifests(path: Path, data: SessionData) -> dict:
-    """Discover six strict cage2/3/4 top/front files for a no-video session."""
+    """Discover strict cage2/3/4 top/front files for legacy sessions.
 
-    if data.video_manifests:
-        return dict(data.video_manifests)
+    Old Windows sessions may contain six ``videos`` entries whose ``path``
+    values are drive-letter paths but no ``relative_path``.  When those paths
+    are unavailable on Linux, the same subject directory can still be mapped
+    safely by the established cage/direction layout.  This function returns
+    that derived mapping in memory only; it never writes back to the source
+    session automatically.
+    """
+
+    existing = dict(data.video_manifests)
+    legacy_windows_paths = bool(existing) and all(
+        not item.get("relative_path")
+        and len(str(item.get("path", ""))) >= 3
+        and str(item.get("path", ""))[1] == ":"
+        and str(item.get("path", ""))[2:3] in {"/", "\\"}
+        for item in existing.values())
+    if existing and not legacy_windows_paths:
+        return existing
     path = Path(path)
     stem = path.name
     for suffix in (".mvsp.json", ".json", ".mvsp"):
@@ -372,7 +387,13 @@ def discover_legacy_video_manifests(path: Path, data: SessionData) -> dict:
                          if item.is_file()
                          and item.stem.lower() == filename.lower()
                          and item.suffix.lower() in {".mp4", ".avi", ".mkv", ".mov"})
-        manifests[view] = {"path": str(candidate), "file_name": candidate.name}
+        manifest = dict(existing.get(view, {}))
+        manifest.update({
+            "path": str(candidate),
+            "relative_path": _relative_path(candidate, path),
+            "file_name": candidate.name,
+        })
+        manifests[view] = manifest
     return manifests
 
 

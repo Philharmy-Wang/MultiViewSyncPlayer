@@ -168,5 +168,7 @@ def test_legacy_no_video_discovery_uses_strict_subject_layout(tmp_path):
 
     data = load_session(session)
     manifests = discover_legacy_video_manifests(session, data)
-    assert manifests["View 1"]["path"].endswith("cage2\\top\\TestA_1_24332_top_2.MP4")
-    assert manifests["View 6"]["path"].endswith("cage4\\front\\TestA_1_24332_front_4.MP4")
+    assert manifests["View 1"]["path"].replace("\\", "/").endswith(
+        "cage2/top/TestA_1_24332_top_2.MP4")
+    assert manifests["View 6"]["path"].replace("\\", "/").endswith(
+        "cage4/front/TestA_1_24332_front_4.MP4")

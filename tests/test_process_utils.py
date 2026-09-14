@@ -1,9 +1,13 @@
 import subprocess
 
+import pytest
+
 from multiview_sync_player import process_utils
 
 
 def test_windows_hidden_subprocess_flags(monkeypatch):
+    if not hasattr(subprocess, "CREATE_NO_WINDOW"):
+        pytest.skip("Windows subprocess flags are unavailable on this host")
     monkeypatch.setattr(process_utils.sys, "platform", "win32")
     options = process_utils.hidden_process_kwargs()
     assert options["shell"] is False

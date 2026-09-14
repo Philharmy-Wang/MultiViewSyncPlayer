@@ -21,10 +21,12 @@ def hidden_process_kwargs() -> dict[str, Any]:
     }
     if sys.platform == "win32":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = subprocess.SW_HIDE
-        kwargs["startupinfo"] = startupinfo
+        startupinfo_factory = getattr(subprocess, "STARTUPINFO", None)
+        if startupinfo_factory is not None:
+            startupinfo = startupinfo_factory()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            kwargs["startupinfo"] = startupinfo
     return kwargs
 
 

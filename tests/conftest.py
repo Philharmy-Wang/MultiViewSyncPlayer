@@ -1,4 +1,5 @@
 import os
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -7,6 +8,18 @@ import pytest
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Keep first-run Qt dialogs out of automated tests without changing the user's
+# real MultiViewSyncPlayer settings.  This also makes a clean portable-build
+# environment deterministic.
+os.environ.setdefault(
+    "XDG_CONFIG_HOME",
+    tempfile.mkdtemp(prefix="mvsp-pytest-config-"),
+)
+
+from PySide6.QtCore import QSettings
+
+
+QSettings("MultiViewSyncPlayer", "App").setValue("welcomed", True)
 
 
 @pytest.fixture(scope="session")
@@ -41,4 +54,3 @@ def synthetic_videos(tmp_path_factory):
         writer.release()
         paths[camera] = Path(path)
     return paths
-

@@ -63,9 +63,10 @@ class SessionLoadThread(QThread):
 
     def run(self):
         try:
-            if not self.data.video_manifests:
-                self.data.video_manifests = discover_legacy_video_manifests(
-                    Path(self.path), self.data)
+            discovered = discover_legacy_video_manifests(
+                Path(self.path), self.data)
+            if discovered != self.data.video_manifests:
+                self.data.video_manifests = discovered
                 MainWindow._add_cells_for_manifests(self.data)
             initial = resolve_session_videos(self.data, Path(self.path))
             actual = {}
