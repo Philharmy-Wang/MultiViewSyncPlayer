@@ -1,4 +1,4 @@
-"""PyInstaller Windows onedir specification for v0.2.3-test."""
+"""PyInstaller Windows onedir specification for v0.2.3-test2."""
 
 import os
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(SPECPATH).parent
 PKG = ROOT / "packaging"
 DIST_NAME = os.environ.get(
-    "MVSP_DIST_NAME", "MultiViewSyncPlayer-v0.2.3-test-win64")
+    "MVSP_DIST_NAME", "MultiViewSyncPlayer-v0.2.3-test2-win64")
 
 a = Analysis(
     [str(PKG / "run_mvsp.py")],
@@ -20,7 +20,9 @@ a = Analysis(
         "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets",
         "PySide6.QtSvg",
     ],
-    excludes=["tkinter", "unittest", "pytest", "IPython"],
+    # scipy._lib._testutils imports unittest while importing scipy.io;
+    # excluding the stdlib module breaks waveform generation in the EXE.
+    excludes=["tkinter", "pytest", "IPython"],
     noarchive=False,
 )
 a.binaries = [

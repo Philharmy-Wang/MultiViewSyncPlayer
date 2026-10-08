@@ -48,11 +48,16 @@ def _find_ffmpeg() -> str:
         candidate = base / "bin" / "ffmpeg.exe"
         if candidate.is_file():
             return str(candidate)
-    # 1. System PATH
+    # 1. Windows source checkout, using the same tools as the portable build.
+    if sys.platform == "win32":
+        candidate = Path(__file__).resolve().parents[1] / "packaging" / "bin" / "ffmpeg.exe"
+        if candidate.is_file():
+            return str(candidate)
+    # 2. System PATH
     p = shutil.which("ffmpeg")
     if p:
         return p
-    # 2. imageio_ffmpeg package
+    # 3. imageio_ffmpeg package
     try:
         import imageio_ffmpeg
         p = imageio_ffmpeg.get_ffmpeg_exe()
@@ -60,7 +65,7 @@ def _find_ffmpeg() -> str:
             return p
     except Exception:
         pass
-    # 3. Common conda / system locations
+    # 4. Common conda / system locations
     for candidate in [
         r"C:\ProgramData\miniconda3\Library\bin\ffmpeg.exe",
         r"C:\ProgramData\miniconda3\Scripts\ffmpeg.exe",
